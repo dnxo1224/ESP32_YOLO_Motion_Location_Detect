@@ -1,3 +1,4 @@
 data/
 preprocessing/processed_tensors/
 data_aligned_800/
+data_interpolated_spline_800/
