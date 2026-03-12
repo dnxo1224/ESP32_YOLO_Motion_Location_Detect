@@ -3,6 +3,8 @@ import glob
 import numpy as np
 import pandas as pd
 from scipy.signal import butter, filtfilt
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
 
 # --- 파이프라인 상수 ---
 NULL_SUBCARRIERS_192 = list(range(0, 6)) + [32] + list(range(59, 66)) + list(range(123, 134)) + [191]
@@ -85,8 +87,24 @@ def process_single_experiment(base_dir, subj, action, sample_num):
     merged_df = extracted_dfs[0].join(extracted_dfs[1:], how='outer').sort_index()
     if len(merged_df) == 0: return None
 
+    # ==========================================
+    # [정렬 및 결측 판단] 시퀀스 순서대로 4개의 RX 데이터를 정렬 및 패킷 유실 알림
+    # ==========================================
     start_seq = merged_df.index.min()
-    merged_df = merged_df.reindex(range(start_seq, start_seq + 900))
+    end_seq = start_seq + 899  # 900 패킷 (30초)
+
+    print(f"\n  [INFO] 정렬 및 결측 분석 ({subj} - {action} - {sample_num})")
+    print(f"  -> 패킷 시퀀스 범위 (Raw): {merged_df.index.min()} ~ {merged_df.index.max()} (고유 seq: {len(merged_df)}개)")
+
+    # 시퀀스 순서대로 900개의 시퀀스를 보장하여 재정렬. 이 과정에서 누락된 seq_id는 전체 NaN 행으로 추가되어 정렬됨.
+    merged_df = merged_df.reindex(range(start_seq, end_seq + 1))
+
+    # 보간 이전에 각 RX별 결측 패킷(Missing packets) 개수 판단 및 출력
+    for i in range(1, 5):
+        col_name = f'rx{i}_amps'
+        received_count = merged_df[col_name].notna().sum()
+        missing_count = 900 - received_count
+        print(f"  -> RX{i} 보간 전 누락 패킷: {missing_count}개 (수신: {received_count}/900)")
 
     rx_tensors = []
     for i in range(1, 5):
@@ -99,12 +117,37 @@ def process_single_experiment(base_dir, subj, action, sample_num):
                 rx_matrix.append(np.full(NUM_SUBCARRIERS, np.nan))
 
         rx_df = pd.DataFrame(rx_matrix)
-        # 1) Spline
-        rx_df = rx_df.interpolate(method='spline', order=3).bfill().ffill().fillna(0)
-        # 2) Hampel
+
+        # ==========================================
+        # [Step 1] 시간에 따른 패킷 드롭(전체 행 결측) 보간
+        # ==========================================
+        # 전체가 NaN인 행(Packet Drop)에 대해서만 위아래 시간 흐름에 따라 선형/Spline 보간을 진행합니다.
+        # 부분적으로 NaN이 있는 경우는 MICE가 해결할 수 있도록 내버려둡니다.
+        full_nan_mask = rx_df.isna().all(axis=1)
+        if full_nan_mask.any():
+            # 임시로 전체 NaN인 곳만 보간하기 편하게 제한적 처리를 구사할 수도 있지만, 
+            # pandas 특성상 전체에 적용 후, 부분 결측치는 다시 NaN으로 돌려놓는 트릭을 사용합니다.
+            temp_df = rx_df.copy()
+            temp_df = temp_df.interpolate(method='spline', order=3).bfill().ffill()
+            rx_df[full_nan_mask] = temp_df[full_nan_mask]
+
+        # ==========================================
+        # [Step 2] 서브캐리어 간 연관성을 이용한 MICE 예측 (부분 결측)
+        # ==========================================
+        # 만약 일부 서브캐리어 데이터만 유실된 '부분 결측치'가 존재한다면,
+        # 머신러닝(MICE)을 활용하여 같은 시간대의 다른 서브캐리어 정보를 보고 예측해 채워넣습니다.
+        if rx_df.isna().sum().sum() > 0:
+            imputer = IterativeImputer(max_iter=10, random_state=42)
+            rx_imputed = imputer.fit_transform(rx_df.values)
+            rx_df = pd.DataFrame(rx_imputed)
+
+        # 방어 코드 (여전히 남은 결측치가 있다면 0으로 초기화)
+        rx_df = rx_df.fillna(0)
+
+        # ==========================================
+        # [Step 3] 이상치 및 노이즈 제거 (Hampel & Low-Pass)
+        # ==========================================
         rx_vals = hampel_filter_2d(rx_df.values, window_size=5, n_sigmas=3)
-        rx_vals = pd.DataFrame(rx_vals).bfill().ffill().fillna(0).values
-        # 3) Low-Pass Filter
         rx_vals = butter_lowpass_filter(rx_vals, cutoff=3.0, fs=30.0)
         rx_tensors.append(rx_vals)
 
@@ -113,8 +156,9 @@ def process_single_experiment(base_dir, subj, action, sample_num):
     return tensor_3d
 
 def process_all_data():
-    base_dir = "/Users/seolwootae/ESP32_YOLO/data"
-    output_dir = "/Users/seolwootae/ESP32_YOLO/preprocessing/processed_tensors"
+    # 현재 스크립트 위치 기준으로 상위 폴더의 data 디렉토리 참조
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data'))
+    output_dir = os.path.join(os.path.dirname(__file__), 'processed_tensors')
     os.makedirs(output_dir, exist_ok=True)
 
     subjects = ["jhj", "kjh", "kmh", "swt"]
