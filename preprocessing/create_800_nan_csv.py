@@ -3,10 +3,12 @@ import glob
 import numpy as np
 import pandas as pd
 
-# --- 파이프라인 상수 ---
-NULL_SUBCARRIERS_192 = list(range(0, 6)) + [32] + list(range(59, 66)) + list(range(123, 134)) + [191]
-VALID_IDX_192 = [i for i in range(192) if i not in NULL_SUBCARRIERS_192]
-NUM_SUBCARRIERS = 166
+# --- 파이프라인 상수 (HT-LTF only) ---
+# HT40 모드: 192 서브캐리어 = LLTF(0~63) + HT-LTF(64~191)
+# HT-LTF만 사용: 인덱스 64~191 중 null 서브캐리어 제거
+NULL_IN_HT_LTF = [64, 65] + list(range(123, 134)) + [191]  # 14개 null
+VALID_HT_LTF_IDX = [i for i in range(64, 192) if i not in NULL_IN_HT_LTF]
+NUM_SUBCARRIERS = len(VALID_HT_LTF_IDX)  # 114개
 
 # --- 유틸리티 함수 ---
 def extract_csi_amplitude(row_data):
@@ -36,7 +38,7 @@ def preprocess_single_rx(df_rx):
     cleaned = []
     for a in amps:
         if a is None: cleaned.append(None)
-        elif len(a) == 192: cleaned.append(a[VALID_IDX_192])
+        elif len(a) == 192: cleaned.append(a[VALID_HT_LTF_IDX])  # HT-LTF만 추출
         elif len(a) == 64: cleaned.append(a[list(range(6, 32)) + list(range(33, 59))])
         else: cleaned.append(a)
     return cleaned
@@ -74,9 +76,9 @@ def generate_from_paths(rx_paths, subj, action, sample_num, output_dir):
     merged_df = extracted_dfs[0].join(extracted_dfs[1:], how='outer').sort_index()
     if len(merged_df) == 0: return False
 
-    # 800 패킷 강제 추출 및 정렬 (비어있는 시퀀스는 모든 RX가 NaN으로 들어감)
-    start_seq = merged_df.index.min()
-    end_seq = start_seq + 799  # 딱 800개 (0~799)
+    # 앞 50개 시퀀스 건너뛰고, 51번째부터 872 패킷 강제 추출
+    start_seq = merged_df.index.min() + 50
+    end_seq = start_seq + 871  # 딱 872개
     merged_df = merged_df.reindex(range(start_seq, end_seq + 1))
 
     # 각 RX 별로 컬럼을 쪼개서 개별 CSV 파일로 저장
@@ -85,64 +87,38 @@ def generate_from_paths(rx_paths, subj, action, sample_num, output_dir):
         rx_cols = [c for c in merged_df.columns if c.startswith(f'rx{i}_sub_')]
         rx_df_subset = merged_df[rx_cols]
         
-        # 저장 형태: jhj_walk_1_rx1_800.csv 또는 none_empty_1_rx1_800.csv
-        out_name = f"{subj}_{action}_{sample_num}_rx{i}_800.csv" if subj != "none_empty" else f"none_empty_{sample_num}_rx{i}_800.csv"
+        out_name = f"{subj}_{action}_{sample_num}_rx{i}_872.csv"
         out_path = os.path.join(output_dir, out_name)
         rx_df_subset.to_csv(out_path)
 
-    print(f" -> Saved 4 RX files: {out_name[:-10]}X_800.csv (Shape: 800x166)")
+    print(f" -> Saved 4 RX files: {out_name[:-10]}X_872.csv (Shape: {len(merged_df)}x{NUM_SUBCARRIERS})")
     
     return True
 
 def process_all_data():
-    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data'))
-    output_dir = os.path.join(os.path.dirname(__file__), '..', 'data_aligned_800')
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '13_raw_data'))
+    output_dir = os.path.join(os.path.dirname(__file__), '..', 'data_aligned_872')
     os.makedirs(output_dir, exist_ok=True)
     
-    # none_empty 추가
-    subjects = ["jhj", "kjh", "kmh", "swt", "none"]
     all_experiments = []
     
-    for subj in subjects:
-        if subj == "none":
-            # none_empty 폴더 내부 파일 파싱
-            subj_dir = os.path.join(base_dir, "none_empty")
-            if not os.path.exists(subj_dir): continue
-            rx1_files = glob.glob(os.path.join(subj_dir, "*_rx1.csv"))
-            for f in rx1_files:
-                parts = os.path.basename(f).split('_')
-                # none_empty_1_rx1.csv -> parts: ['none', 'empty', '1', 'rx1.csv']
-                if len(parts) >= 4:
-                    # subj: "none_empty", action: parts[1] ('empty'), sample_num: parts[2] ('1')
-                    all_experiments.append(("none_empty", parts[1], parts[2]))
-        else:
-            subj_dir = os.path.join(base_dir, subj)
-            if not os.path.exists(subj_dir): continue
-            rx1_files = glob.glob(os.path.join(subj_dir, f"{subj}_*_rx1.csv"))
-            for f in rx1_files:
-                parts = os.path.basename(f).split('_')
-                if len(parts) >= 4:
-                    all_experiments.append((subj, parts[1], parts[2]))
+    # 13_raw_data/ 폴더에서 직접 rx1 파일을 탐색 (하위 폴더 없음)
+    rx1_files = glob.glob(os.path.join(base_dir, "*_rx1.csv"))
+    for f in rx1_files:
+        parts = os.path.basename(f).split('_')
+        if len(parts) >= 4:
+            all_experiments.append((parts[0], parts[1], parts[2]))
 
     all_experiments.sort()
     total = len(all_experiments)
     
-    print(f"총 {total}개의 실험 데이터를 800-패킷 시퀀스로 정렬하여 {output_dir} 에 저장합니다...\n")
+    print(f"총 {total}개의 실험 데이터를 872-패킷 시퀀스로 정렬하여 {output_dir} 에 저장합니다...\n")
     print("=" * 60)
 
     success_cnt = 0
     for idx, (subj, action, sample_num) in enumerate(all_experiments):
         print(f"[{idx+1}/{total}] {subj}_{action}_{sample_num} 처리중...")
-        if subj == "none_empty":
-            # none_empty의 경우 base_dir/none_empty 폴더 경로에 접근하게 해야 하므로,
-            # generate_800_csv_single_experiment 내에서 path 구조 분기를 위해 base_dir 활용
-            
-            # 여기서 편의상 base_dir 밑에 바로 none_empty 폴더가 있고 
-            # 파일이 none_empty_1_rx{i}.csv 임을 고려하여 rx_paths를 강제로 생성해 넘겨주는 방식보다는
-            # 함수를 약간 리팩토링합니다.
-            rx_paths = [os.path.join(base_dir, "none_empty", f"none_empty_{sample_num}_rx{i}.csv") for i in range(1, 5)]
-        else:
-            rx_paths = [os.path.join(base_dir, subj, f"{subj}_{action}_{sample_num}_rx{i}.csv") for i in range(1, 5)]
+        rx_paths = [os.path.join(base_dir, f"{subj}_{action}_{sample_num}_rx{i}.csv") for i in range(1, 5)]
             
         if generate_from_paths(rx_paths, subj, action, sample_num, output_dir):
             success_cnt += 1

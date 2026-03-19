@@ -16,3 +16,4 @@ __pycache__/
 venv/
 .DS_Store
 *.pt
+13_Data_Processing/results/

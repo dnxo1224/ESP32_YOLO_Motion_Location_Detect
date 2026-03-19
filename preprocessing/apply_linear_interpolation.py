@@ -4,11 +4,11 @@ import pandas as pd
 import numpy as np
 
 def interpolate_all_files():
-    input_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data_aligned_800'))
-    output_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data_interpolated_linear_800'))
+    input_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data_aligned_872'))
+    output_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data_interpolated_linear_872'))
     os.makedirs(output_dir, exist_ok=True)
 
-    csv_files = sorted(glob.glob(os.path.join(input_dir, "*_800.csv")))
+    csv_files = sorted(glob.glob(os.path.join(input_dir, "*_872.csv")))
     total_files = len(csv_files)
 
     print(f"총 {total_files}개의 RX 데이터에 대해 [Linear] 보간을 실행합니다.\n")
