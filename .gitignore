@@ -17,3 +17,7 @@ venv/
 .DS_Store
 *.pt
 13_Data_Processing/results/
+LightGBM/data
+LightGBM/processed/
+LightGBM/results/
+.claude/

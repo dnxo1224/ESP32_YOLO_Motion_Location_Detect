@@ -21,8 +21,12 @@ from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from dataset import CSIDataset, normalize_data, get_device, ALL_SUBJECTS, NUM_ACTIONS, NUM_ZONES
+from dataset import CSIDataset, RawCSIDataset, normalize_data, normalize_raw_data
 from model import WiDRNet
+from config import (
+    DEVICE, ALL_SUBJECTS, NUM_ACTIONS, NUM_ZONES,
+    ACTION_NAMES, ZONE_NAMES, RESULTS_DIR, WEIGHTS_DIR,
+)
 
 # ============================================================
 # 하이퍼파라미터 (논문 Section IV-B-2 최적값)
@@ -34,20 +38,12 @@ WEIGHT_DECAY = 1e-4
 LAMBDA_REG = 0.7      # 논문 최적 parameter sharing 강도
 MIXUP_ALPHA = 0.4     # 논문 최적 Beta 분포 파라미터
 GRAD_CLIP = 1.0
-D_MODEL = 128
+D_MODEL = 128         # 논문 최적 (d_k)
 NUM_HEADS = 4         # 논문 최적
 D_FFN = 256           # 논문 최적
 DROPOUT = 0.1
-
-# 경로
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-RESULTS_DIR = os.path.join(SCRIPT_DIR, 'results')
-WEIGHTS_DIR = os.path.join(SCRIPT_DIR, 'weights')
-os.makedirs(RESULTS_DIR, exist_ok=True)
-os.makedirs(WEIGHTS_DIR, exist_ok=True)
-
-ACTION_NAMES = ['handsup', 'sit', 'stand', 'walk']
-ZONE_NAMES = ['Zone0', 'Zone1', 'Zone2', 'Zone3']
+USE_CDE    = False    # True: RawCSIDataset + WiDRNet(use_cde=True) | False: 기존 경로
+CDE_HIDDEN = 400      # CDE 은닉 노드 w (논문 최적: 400)
 
 
 # ============================================================
@@ -149,17 +145,23 @@ def train_one_split(train_subjects, test_subjects, device, tag="", save_best=Tru
     print(f"[{tag}] Test:  {test_subjects}")
     print(f"{'='*60}")
 
-    train_dataset = CSIDataset(train_subjects)
-    test_dataset = CSIDataset(test_subjects)
-    normalize_data(train_dataset, test_dataset)
+    if USE_CDE:
+        train_dataset = RawCSIDataset(train_subjects)
+        test_dataset  = RawCSIDataset(test_subjects)
+        normalize_raw_data(train_dataset, test_dataset)
+    else:
+        train_dataset = CSIDataset(train_subjects)
+        test_dataset  = CSIDataset(test_subjects)
+        normalize_data(train_dataset, test_dataset)
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    test_loader  = DataLoader(test_dataset,  batch_size=BATCH_SIZE, shuffle=False)
 
     # --- 모델 ---
     model = WiDRNet(
         d_model=D_MODEL, num_heads=NUM_HEADS, d_ffn=D_FFN,
-        num_actions=NUM_ACTIONS, num_zones=NUM_ZONES, dropout=DROPOUT
+        num_actions=NUM_ACTIONS, num_zones=NUM_ZONES, dropout=DROPOUT,
+        use_cde=USE_CDE, cde_hidden=CDE_HIDDEN,
     ).to(device)
 
     criterion = nn.CrossEntropyLoss()
@@ -339,7 +341,7 @@ def run_mode_b(device):
 # Main
 # ============================================================
 def main():
-    device = get_device()
+    device = DEVICE
     print(f"Device: {device}")
     print(f"Hyperparameters: epochs={EPOCHS}, batch={BATCH_SIZE}, lr={LR}, "
           f"lambda={LAMBDA_REG}, mixup_alpha={MIXUP_ALPHA}")

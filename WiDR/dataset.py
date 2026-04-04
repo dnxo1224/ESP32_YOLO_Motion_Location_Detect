@@ -10,6 +10,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
 
 # --- 상수 정의 ---
 SEQ_LEN = 872
@@ -117,9 +118,150 @@ def normalize_data(train_dataset, test_dataset):
 
 
 def get_device():
-    """MPS > CUDA > CPU 순서로 디바이스 선택"""
-    if torch.backends.mps.is_available():
-        return torch.device('mps')
-    elif torch.cuda.is_available():
+    """CUDA > CPU 순서로 디바이스 선택"""
+    if torch.cuda.is_available():
         return torch.device('cuda')
     return torch.device('cpu')
+
+
+# ============================================================
+# Raw CSI Dataset (Neural CDE용) — 13_raw_data/ 직접 로드
+# ============================================================
+
+# 상수 (config.py와 동기화)
+_RAW_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '13_raw_data')
+_SKIP_FIRST   = 50
+_L_FIXED      = SEQ_LEN   # 872
+
+
+class RawCSIDataset(Dataset):
+    """
+    Raw CSI 데이터셋 — Neural CDE 입력용
+
+    13_raw_data/ 에서 직접 로드하여 NaN 그리드로 변환.
+    torchcde의 natural_cubic_spline_coeffs 가 NaN을 자동 보간.
+
+    반환: (x, y_action, y_zone)
+      x: (4, L_fixed, 115) — 4 RX × 872 프레임 × (114 진폭 + 1 시간채널)
+         진폭은 누락 패킷 위치가 NaN, 시간채널은 항상 채워짐
+    """
+    def __init__(self, subjects, raw_dir=None, l_fixed=_L_FIXED, skip_first=_SKIP_FIRST):
+        from preprocess import preprocess_raw_csv  # 순환 import 방지
+
+        if raw_dir is None:
+            raw_dir = _RAW_DATA_DIR
+
+        self.data          = []
+        self.action_labels = []
+        self.zone_labels   = []
+
+        # rx1 파일 기준으로 샘플 목록 구성
+        rx1_files = sorted(glob.glob(os.path.join(raw_dir, '*_rx1.csv')))
+        if not rx1_files:
+            print(f"[RawCSIDataset] Raw data 없음: {raw_dir}")
+
+        for f in tqdm(rx1_files, desc='[RawCSIDataset] 로딩'):
+            basename = os.path.basename(f).replace('_rx1.csv', '')
+            parts    = basename.split('_')
+            subject, action, position = parts[0], parts[1], int(parts[2])
+
+            if subject not in subjects or action not in ACTION_MAP:
+                continue
+
+            try:
+                # ── 공통 시간 그리드 결정 (rx1 기준) ──────────────────
+                seq_ids_rx1, _ = preprocess_raw_csv(f)
+                if len(seq_ids_rx1) == 0:
+                    continue
+                start_seq = int(seq_ids_rx1.min()) + skip_first
+                grid      = np.arange(start_seq, start_seq + l_fixed, dtype=np.int64)
+
+                # ── 4 RX 로드 → NaN 그리드 생성 ─────────────────────
+                rx_grids = []
+                skip_sample = False
+                for rx in range(1, NUM_RX + 1):
+                    rx_path = os.path.join(raw_dir, f"{subject}_{action}_{position}_rx{rx}.csv")
+                    seq_ids, amp_matrix = preprocess_raw_csv(rx_path)
+
+                    # 중복 seq_id 제거 (재전송 패킷)
+                    _, unique_idx = np.unique(seq_ids, return_index=True)
+                    seq_ids    = seq_ids[unique_idx]
+                    amp_matrix = amp_matrix[unique_idx]
+
+                    # 유효 패킷이 2개 미만이면 보간 불가
+                    if len(seq_ids) < 2:
+                        skip_sample = True
+                        break
+
+                    # NaN 그리드 구성 (872, 114)
+                    amp_grid = np.full((l_fixed, NUM_SUBCARRIERS), np.nan, dtype=np.float32)
+                    sid_to_idx = {int(sid): i for i, sid in enumerate(seq_ids)}
+                    for j, sid in enumerate(grid):
+                        if sid in sid_to_idx:
+                            amp_grid[j] = amp_matrix[sid_to_idx[sid]]
+
+                    # 시간 채널 추가: i/30.0 (항상 채워짐)
+                    t_rel = (np.arange(l_fixed, dtype=np.float32) / 30.0).reshape(-1, 1)
+                    rx_grids.append(np.hstack([amp_grid, t_rel]))  # (872, 115)
+
+                if skip_sample:
+                    continue
+
+                # (4, 872, 115)
+                self.data.append(np.stack(rx_grids, axis=0))
+                self.action_labels.append(ACTION_MAP[action])
+                self.zone_labels.append(ZONE_MAP[position])
+
+            except (FileNotFoundError, Exception) as e:
+                print(f"[RawCSIDataset] 스킵 {basename}: {e}")
+                continue
+
+        self.data          = np.array(self.data, dtype=np.float32)   # (N, 4, 872, 115)
+        self.action_labels = np.array(self.action_labels)
+        self.zone_labels   = np.array(self.zone_labels)
+        print(f"[RawCSIDataset] {len(self.data)}개 샘플 로드 완료")
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        x        = torch.tensor(self.data[idx], dtype=torch.float32)  # (4, 872, 115)
+        y_action = torch.tensor(self.action_labels[idx], dtype=torch.long)
+        y_zone   = torch.tensor(self.zone_labels[idx],   dtype=torch.long)
+        return x, y_action, y_zone
+
+
+def normalize_raw_data(train_dataset: RawCSIDataset,
+                       test_dataset:  RawCSIDataset) -> StandardScaler:
+    """
+    RawCSIDataset 진폭 채널(0:114)만 정규화 (in-place).
+    시간 채널(index 114)은 건드리지 않음.
+
+    Returns:
+        train 기준으로 fit된 StandardScaler
+    """
+    scaler = StandardScaler()
+
+    # train 진폭만 추출하여 fit
+    # data shape: (N, 4, 872, 115) → 진폭: (N, 4, 872, 114)
+    train_amp  = train_dataset.data[:, :, :, :NUM_SUBCARRIERS]
+    train_flat = train_amp.reshape(-1, NUM_SUBCARRIERS)
+    scaler.fit(train_flat)
+
+    # train 적용
+    train_dataset.data[:, :, :, :NUM_SUBCARRIERS] = (
+        scaler.transform(train_flat)
+        .reshape(-1, NUM_RX, SEQ_LEN, NUM_SUBCARRIERS)
+        .astype(np.float32)
+    )
+
+    # test 적용
+    test_amp  = test_dataset.data[:, :, :, :NUM_SUBCARRIERS]
+    test_flat = test_amp.reshape(-1, NUM_SUBCARRIERS)
+    test_dataset.data[:, :, :, :NUM_SUBCARRIERS] = (
+        scaler.transform(test_flat)
+        .reshape(-1, NUM_RX, SEQ_LEN, NUM_SUBCARRIERS)
+        .astype(np.float32)
+    )
+
+    return scaler

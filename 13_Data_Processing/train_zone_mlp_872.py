@@ -1,7 +1,7 @@
 """
-MLP Zone 분류기 (872 x 114 x 4 데이터)
+MLP Zone 분류기 (800 x 166 x 4 데이터)
 시간축 통계특징 기반 zone 분류
-Train: 12명, Test: kjh
+Train: 12명, Test: kms (또는 설정된 TEST_SUBJECT)
 """
 import os
 import sys
@@ -20,7 +20,7 @@ from tqdm import tqdm
 
 from dataset_872 import (
     CSIDataset872, normalize_data, get_device,
-    TRAIN_SUBJECTS, TEST_SUBJECT, FEATURE_DIM
+    TRAIN_SUBJECTS, TEST_SUBJECT, FEATURE_DIM, SEQ_LEN
 )
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), 'results')
@@ -34,7 +34,7 @@ class ZoneMLP(nn.Module):
     def __init__(self, input_dim=FEATURE_DIM, num_classes=4, use_stats=True):
         super().__init__()
         self.use_stats = use_stats
-        feat_dim = input_dim * 4 if use_stats else input_dim  # 1824 or 456
+        feat_dim = input_dim * 4 if use_stats else input_dim  # 664*4 = 2656 or 664
 
         self.net = nn.Sequential(
             nn.Linear(feat_dim, 512),
@@ -53,15 +53,15 @@ class ZoneMLP(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, 872, 456)
+        # x: (B, 800, 664)
         if self.use_stats:
-            x_mean = x.mean(dim=1)    # (B, 456)
-            x_std = x.std(dim=1)      # (B, 456)
-            x_max = x.max(dim=1)[0]   # (B, 456)
-            x_min = x.min(dim=1)[0]   # (B, 456)
-            x = torch.cat([x_mean, x_std, x_max, x_min], dim=1)  # (B, 1824)
+            x_mean = x.mean(dim=1)    # (B, 664)
+            x_std = x.std(dim=1)      # (B, 664)
+            x_max = x.max(dim=1)[0]   # (B, 664)
+            x_min = x.min(dim=1)[0]   # (B, 664)
+            x = torch.cat([x_mean, x_std, x_max, x_min], dim=1)  # (B, 2656)
         else:
-            x = x.mean(dim=1)  # (B, 456)
+            x = x.mean(dim=1)  # (B, 664)
         return self.net(x)
 
 
@@ -69,18 +69,31 @@ def train_model():
     device = get_device()
     print(f"Device: {device}")
 
+    # 슬라이딩 윈도우 설정
+    WINDOW_SIZE = 200
+    STRIDE = 10
+
     # 데이터 로드
-    print("Loading data...")
-    train_dataset = CSIDataset872(TRAIN_SUBJECTS, task='zone')
-    test_dataset = CSIDataset872([TEST_SUBJECT], task='zone')
+    print(f"Loading data (Window Size: {WINDOW_SIZE}, Stride: {STRIDE})...")
+    train_dataset = CSIDataset872(TRAIN_SUBJECTS, task='zone', window_size=WINDOW_SIZE, stride=STRIDE)
+    test_dataset = CSIDataset872([TEST_SUBJECT], task='zone', window_size=WINDOW_SIZE, stride=STRIDE)
 
     # 정규화
-    normalize_data(train_dataset, test_dataset)
+    # dataset_872.py의 normalize_data가 SEQ_LEN을 사용하므로, 
+    # 여기서는 수동으로 처리하거나 dataset_872.py를 유연하게 수정해야 함.
+    # 일단 여기서 수동 정규화 수행
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler()
+    train_flat = train_dataset.data.reshape(-1, FEATURE_DIM)
+    scaler.fit(train_flat)
+    train_dataset.data = scaler.transform(train_flat).reshape(-1, WINDOW_SIZE, FEATURE_DIM).astype(np.float32)
+    test_flat = test_dataset.data.reshape(-1, FEATURE_DIM)
+    test_dataset.data = scaler.transform(test_flat).reshape(-1, WINDOW_SIZE, FEATURE_DIM).astype(np.float32)
 
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
 
-    print(f"Train: {len(train_dataset)} samples, Test: {len(test_dataset)} samples")
+    print(f"Train: {len(train_dataset)} windows, Test: {len(test_dataset)} windows")
 
     # 두 가지 MLP 모델 비교: mean-only vs stats
     results = {}
@@ -97,11 +110,11 @@ def train_model():
         best_acc = 0
         best_epoch = 0
 
-        for epoch in tqdm(range(50), desc=f"MLP({name})"):
+        for epoch in range(50):
             # Train
             model.train()
             train_loss, train_correct = 0, 0
-            for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}", leave=False):
+            for inputs, labels in train_loader:
                 inputs, labels = inputs.to(device), labels.to(device)
                 optimizer.zero_grad()
                 outputs = model(inputs)
@@ -158,7 +171,8 @@ def train_model():
 
         print(f"\nClassification Report ({name}):")
         print(classification_report(all_labels, all_preds,
-                                    target_names=[f'Zone {i}' for i in range(4)]))
+                                    target_names=[f'Zone {i}' for i in range(4)],
+                                    zero_division=0))
 
     # 결과 요약
     print("\n" + "="*50)
