@@ -21,3 +21,5 @@ LightGBM/data
 LightGBM/processed/
 LightGBM/results/
 .claude/
+*.png
+*.jpg

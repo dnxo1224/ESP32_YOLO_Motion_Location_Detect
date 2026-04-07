@@ -32,7 +32,7 @@ TRAIN_SUBJECTS = [s for s in ALL_SUBJECTS if s != TEST_SUBJECT]
 
 # LightGBM/processed 디렉토리 (이 파일 기준 ../../LightGBM/processed)
 DATA_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), '..', '..', 'LightGBM', 'processed')
+    os.path.join(os.path.dirname(__file__), '..', 'LightGBM', 'processed')
 )
 
 
@@ -141,7 +141,10 @@ class SlidingWindowDataset(Dataset):
 
             start = 0
             while start + window_size <= seq_len:
-                self.windows.append(seq[start:start + window_size])
+                window = seq[start:start + window_size]
+                # 윈도우별 평균 제거 (추론 시에도 동일하게 적용 가능)
+                window = window - window.mean(axis=0)
+                self.windows.append(window)
                 self.action_labels.append(a_lbl)
                 self.zone_labels.append(z_lbl)
                 self.sample_ids.append(idx)
@@ -160,6 +163,50 @@ class SlidingWindowDataset(Dataset):
         y_action = torch.tensor(self.action_labels[idx], dtype=torch.long)
         y_zone   = torch.tensor(self.zone_labels[idx],   dtype=torch.long)
         return x, y_action, y_zone, self.sample_ids[idx]
+
+    def oversample_zone(self, zone_id: int, factor: int = 2) -> None:
+        """
+        zone_id 데이터를 factor배 복제하여 학습 데이터에 추가한다. (in-place)
+
+        Args:
+            zone_id: 복제할 Zone 번호
+            factor : 복제 배수 (기본 2 → 원본 포함 총 2배)
+        """
+        mask = np.array(self.zone_labels) == zone_id
+        extra = factor - 1  # 추가할 복제 횟수 (factor=2 → 1번 추가)
+
+        zone_windows = self.windows[mask]
+        zone_actions = [v for v, m in zip(self.action_labels, mask) if m]
+        zone_zones   = [v for v, m in zip(self.zone_labels,   mask) if m]
+        zone_ids     = [v for v, m in zip(self.sample_ids,    mask) if m]
+
+        self.windows       = np.concatenate(
+            [self.windows] + [zone_windows] * extra, axis=0
+        )
+        self.action_labels = self.action_labels + zone_actions * extra
+        self.zone_labels   = self.zone_labels   + zone_zones   * extra
+        self.sample_ids    = self.sample_ids    + zone_ids     * extra
+
+        before = mask.sum()
+        after  = before * factor
+        print(f"[oversample_zone={zone_id}] {before} → {after} windows "
+              f"(×{factor}, total: {len(self.windows)})")
+
+    def filter_by_zone(self, zone_id: int) -> 'SlidingWindowDataset':
+        """
+        zone_id에 해당하는 윈도우만 남긴 새 Dataset을 반환한다.
+        원본 Dataset은 변경되지 않는다.
+        """
+        mask = np.array(self.zone_labels) == zone_id
+        new_ds = object.__new__(SlidingWindowDataset)
+        new_ds.window_size   = self.window_size
+        new_ds.stride        = self.stride
+        new_ds.windows       = self.windows[mask]
+        new_ds.action_labels = [v for v, m in zip(self.action_labels, mask) if m]
+        new_ds.zone_labels   = [v for v, m in zip(self.zone_labels,   mask) if m]
+        new_ds.sample_ids    = [v for v, m in zip(self.sample_ids,    mask) if m]
+        print(f"[filter_by_zone={zone_id}] {mask.sum()} / {len(mask)} windows selected")
+        return new_ds
 
 
 # ─── 디바이스 선택 ─────────────────────────────────────────────────────────────
