@@ -15,6 +15,7 @@ Zone Expert Action Classifier — CNN 학습 스크립트
 """
 import os
 import sys
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -29,6 +30,15 @@ import seaborn as sns
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+# ─── 재현성을 위한 랜덤 시드 고정 ────────────────────────────────────────────
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark     = False
 
 from dataset import (
     CSIRawDataset, normalize_datasets, SlidingWindowDataset, get_device,
@@ -47,7 +57,7 @@ ZONE_ID = None
 # USE_OVERSAMPLE : True  → 해당 Zone 데이터 ×2 복제 (데이터 불균형 부여)
 #                  False → 오버샘플링 없이 균등 학습
 USE_RX_WEIGHT  = False
-USE_OVERSAMPLE = False
+USE_OVERSAMPLE = True
 
 # 변형 태그 자동 생성 (저장 경로·파일명에 반영)
 # 예) 둘 다 True → 'cnn' / 둘 다 False → 'cnn_norx_noos'

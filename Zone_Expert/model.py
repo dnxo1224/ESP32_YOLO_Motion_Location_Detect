@@ -36,27 +36,27 @@ class ZoneExpertLSTM(nn.Module):
     """
 
     def __init__(self,
-                 zone_id:    int,
-                 input_dim:  int = FEATURE_DIM,
-                 hidden_dim: int = 128,
-                 num_layers: int = 2,
-                 num_classes: int = 4,
-                 dropout:    float = 0.3,
-                 rx_high_w:  float = RX_HIGH_W,
-                 rx_low_w:   float = RX_LOW_W):
+                 zone_id:       int,
+                 input_dim:     int   = FEATURE_DIM,
+                 hidden_dim:    int   = 128,
+                 num_layers:    int   = 2,
+                 num_classes:   int   = 4,
+                 dropout:       float = 0.3,
+                 use_rx_weight: bool  = True,
+                 rx_high_w:     float = RX_HIGH_W,
+                 rx_low_w:      float = RX_LOW_W):
         super().__init__()
 
-        self.zone_id = zone_id
+        self.zone_id       = zone_id
+        self.use_rx_weight = use_rx_weight
 
         # ── 고정 RX 채널 가중치 벡터 ──────────────────────────────────────────
-        # 664D 벡터는 인터리브 구조:
-        #   RX_k → 인덱스 k, k+4, k+8, ..., k+660  (stride=4, 166개)
-        rx_code_idx = ZONE_RX_MAP[zone_id]
-        w = torch.full((input_dim,), rx_low_w)
-        # 664D 벡터의 RX 채널 인터리브 구조: stride=4, 166개 인덱스 추출
-        feature_idx = torch.arange(rx_code_idx, input_dim, 4)
-        w[feature_idx] = rx_high_w
-        self.register_buffer('rx_weight', w)  # (664,) — 학습 파라미터 아님
+        if use_rx_weight:
+            rx_code_idx = ZONE_RX_MAP[zone_id]
+            w = torch.full((input_dim,), rx_low_w)
+            feature_idx = torch.arange(rx_code_idx, input_dim, 4)
+            w[feature_idx] = rx_high_w
+            self.register_buffer('rx_weight', w)  # (664,) — 학습 파라미터 아님
 
         # ── 단방향 LSTM ───────────────────────────────────────────────────────
         self.lstm = nn.LSTM(
@@ -86,14 +86,14 @@ class ZoneExpertLSTM(nn.Module):
         Returns:
             logits: (B, num_classes)
         """
-        if zone_labels is not None:
-            # 학습 모드: self.zone_id 샘플 → rx_weight 적용, 나머지 → ×1.0
-            mask = (zone_labels == self.zone_id).float()   # (B,)
-            w = mask.view(-1, 1, 1) * (self.rx_weight - 1.0) + 1.0  # (B, 1, 664)
-            x = x * w
-        else:
-            # 추론 모드: 항상 rx_weight 적용
-            x = x * self.rx_weight                         # (B, T, 664)
+        if self.use_rx_weight:
+            if zone_labels is not None:
+                mask = (zone_labels == self.zone_id).float()             # (B,)
+                w = mask.view(-1, 1, 1) * (self.rx_weight - 1.0) + 1.0  # (B, 1, 664)
+                x = x * w
+            else:
+                x = x * self.rx_weight                                   # (B, T, 664)
+        # use_rx_weight=False → x 그대로 (모든 RX 채널 동등)
 
         _, (hn, _) = self.lstm(x)
         out = hn[-1]                                       # (B, hidden_dim)

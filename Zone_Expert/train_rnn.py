@@ -15,6 +15,7 @@ Zone Expert Action Classifier — Vanilla RNN 학습 스크립트
 """
 import os
 import sys
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -29,6 +30,15 @@ import seaborn as sns
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+# ─── 재현성을 위한 랜덤 시드 고정 ────────────────────────────────────────────
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark     = False
 
 from dataset import (
     CSIRawDataset, normalize_datasets, SlidingWindowDataset, get_device,

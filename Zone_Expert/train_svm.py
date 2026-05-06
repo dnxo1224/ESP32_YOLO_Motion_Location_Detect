@@ -22,6 +22,7 @@ Zone Expert Action Classifier — SVM 학습 스크립트
 """
 import os
 import sys
+import random
 import numpy as np
 import joblib
 from sklearn.svm import SVC
@@ -33,6 +34,11 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+# ─── 재현성을 위한 랜덤 시드 고정 ────────────────────────────────────────────
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
 
 from dataset import (
     CSIRawDataset, normalize_datasets, SlidingWindowDataset,

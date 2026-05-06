@@ -10,7 +10,7 @@ Zone Expert 추론 파이프라인
     → ZoneExpert[zone]          → action 예측
 
 [모델 선택]
-  MODEL_TYPE = 'lstm' | 'cnn' | 'rnn' | 'svm
+  MODEL_TYPE = 'transformer_norx' | 'cnn' | 'rnn' | 'svm
 
 [주의]
   ZoneExpertLSTM은 window_size=80으로 학습되었으나,
@@ -19,6 +19,7 @@ Zone Expert 추론 파이프라인
 
 import os
 import sys
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -41,7 +42,7 @@ from dataset import (
 
 # ─── 모델 타입 선택 ────────────────────────────────────────────────────────────
 # 'lstm' | 'cnn' | 'rnn' | 'svm' | 'transformer'
-MODEL_TYPE = 'transformer'
+MODEL_TYPE = 'cnn_norx_noos'
 
 # ─── 설정 ──────────────────────────────────────────────────────────────────────
 WINDOW_SIZE  = 200
@@ -65,7 +66,13 @@ EXPERT_WEIGHTS_DIRS = {
     'cnn_norx_noos'   : os.path.join(BASE_DIR, 'weights_cnn_norx_noos'),
     'rnn'             : os.path.join(BASE_DIR, 'weights_rnn'),
     'svm'             : os.path.join(BASE_DIR, 'weights_svm'),
-    'transformer'     : os.path.join(BASE_DIR, 'weights_transformer'),
+    'transformer'          : os.path.join(BASE_DIR, 'weights_transformer'),
+    'transformer_norx'     : os.path.join(BASE_DIR, 'weights_transformer_norx'),
+    'transformer_noos'     : os.path.join(BASE_DIR, 'weights_transformer_noos'),
+    'transformer_norx_noos': os.path.join(BASE_DIR, 'weights_transformer_norx_noos'),
+    'lstm_norx'            : os.path.join(BASE_DIR, 'weights_lstm_norx'),
+    'lstm_noos'            : os.path.join(BASE_DIR, 'weights_lstm_noos'),
+    'lstm_norx_noos'       : os.path.join(BASE_DIR, 'weights_lstm_norx_noos'),
 }
 
 
@@ -155,23 +162,31 @@ def save_cm(labels, preds, class_names, title, filename):
 # ─── 메인 추론 루프 ───────────────────────────────────────────────────────────
 
 def run():
+    t_total_start = time.perf_counter()
     device = get_device()
     print(f"Device: {device}")
     print(f"Window: {WINDOW_SIZE}  Stride: {STRIDE}")
 
     # ── 데이터 로드 & 정규화 ─────────────────────────────────────────────────
     print("\n[1] Loading & normalizing data...")
+    t0 = time.perf_counter()
     train_raw = CSIRawDataset(TRAIN_SUBJECTS)
     test_raw  = CSIRawDataset([TEST_SUBJECT])
     normalize_datasets(train_raw, test_raw)
+    t_load = time.perf_counter() - t0
+    print(f"    └─ 소요 시간: {t_load:.2f}s")
 
     # ── 슬라이딩 윈도우 (평균 제거 없음) ────────────────────────────────────
     print(f"\n[2] Creating windows (size={WINDOW_SIZE}, stride={STRIDE})...")
+    t0 = time.perf_counter()
     test_win    = InferenceWindowDataset(test_raw, WINDOW_SIZE, STRIDE)
     test_loader = DataLoader(test_win, batch_size=BATCH_SIZE, shuffle=False)
+    t_window = time.perf_counter() - t0
+    print(f"    └─ 소요 시간: {t_window:.2f}s")
 
     # ── 모델 로드 ────────────────────────────────────────────────────────────
-    print(f"\n[3] Loading models (MODEL_TYPE='{MODEL_TYPE}')...")
+    print(f"\n[3] Loading models (MODEL_TYPE = '{MODEL_TYPE}')...")
+    t0 = time.perf_counter()
 
     zone_mlp = ZoneMLP().to(device)
     zone_mlp.load_state_dict(
@@ -183,15 +198,16 @@ def run():
     weights_dir = EXPERT_WEIGHTS_DIRS[MODEL_TYPE]
     experts = {}
 
-    if MODEL_TYPE == 'lstm':
+    if MODEL_TYPE in ('lstm', 'lstm_norx', 'lstm_noos', 'lstm_norx_noos'):
         from model import ZoneExpertLSTM
+        use_rx = ('norx' not in MODEL_TYPE)
         for z in range(NUM_ZONES):
-            m = ZoneExpertLSTM(zone_id=z).to(device)
+            m = ZoneExpertLSTM(zone_id=z, use_rx_weight=use_rx).to(device)
             ckpt = os.path.join(weights_dir, f'zone_expert_action_{z}_best.pt')
             m.load_state_dict(torch.load(ckpt, map_location=device))
             m.eval()
             experts[z] = m
-            print(f"  ZoneExpertLSTM[{z}] loaded ← {ckpt}")
+            print(f"  ZoneExpertLSTM[{z}] (use_rx_weight={use_rx}) loaded ← {ckpt}")
 
     elif MODEL_TYPE in ('cnn', 'cnn_norx', 'cnn_noos', 'cnn_norx_noos'):
         from model_cnn import ZoneExpertCNN
@@ -222,15 +238,16 @@ def run():
             experts[z] = joblib.load(ckpt)
             print(f"  SVM Expert[{z}] loaded ← {ckpt}")
 
-    elif MODEL_TYPE == 'transformer':
+    elif MODEL_TYPE.startswith('transformer'):
         from model_transformer import ZoneExpertTransformer
+        use_rx = ('norx' not in MODEL_TYPE)
         for z in range(NUM_ZONES):
-            m = ZoneExpertTransformer(zone_id=z).to(device)
+            m = ZoneExpertTransformer(zone_id=z, use_rx_weight=use_rx).to(device)
             ckpt = os.path.join(weights_dir, f'zone_expert_action_{z}_best.pt')
             m.load_state_dict(torch.load(ckpt, map_location=device))
             m.eval()
             experts[z] = m
-            print(f"  ZoneExpertTransformer[{z}] loaded ← {ckpt}")
+            print(f"  ZoneExpertTransformer[{z}] (use_rx_weight={use_rx}) loaded ← {ckpt}")
 
     else:
         raise ValueError(
@@ -238,9 +255,12 @@ def run():
             f"Choose from: 'lstm', 'cnn', 'cnn_norx', 'cnn_noos', 'cnn_norx_noos', "
             f"'rnn', 'svm', 'transformer'."
         )
+    t_model = time.perf_counter() - t0
+    print(f"    └─ 소요 시간: {t_model:.2f}s")
 
     # ── 추론 ─────────────────────────────────────────────────────────────────
     print("\n[4] Running inference...")
+    t0 = time.perf_counter()
     all_zone_preds   = []
     all_zone_labels  = []
     all_action_preds  = []
@@ -291,14 +311,30 @@ def run():
             all_action_preds.extend(action_preds.cpu().tolist())
             all_action_labels.extend(y_action.tolist())
 
+    t_inference = time.perf_counter() - t0
+
     # ── 결과 출력 ─────────────────────────────────────────────────────────────
     zone_acc   = sum(p == l for p, l in zip(all_zone_preds,   all_zone_labels))   / len(all_zone_labels)
     action_acc = sum(p == l for p, l in zip(all_action_preds, all_action_labels)) / len(all_action_labels)
+
+    t_total = time.perf_counter() - t_total_start
+    n_windows = len(all_action_labels)
 
     print(f"\n{'='*45}")
     print(f"  Zone   Accuracy : {zone_acc:.4f}")
     print(f"  Action Accuracy : {action_acc:.4f}")
     print(f"{'='*45}")
+    print(f"\n{'─'*45}")
+    print(f"  [시간 요약]")
+    print(f"{'─'*45}")
+    print(f"  [1] 데이터 로드 & 정규화 : {t_load:7.2f}s")
+    print(f"  [2] 슬라이딩 윈도우 생성 : {t_window:7.2f}s")
+    print(f"  [3] 모델 로드            : {t_model:7.2f}s")
+    print(f"  [4] 추론 루프            : {t_inference:7.2f}s  "
+          f"({n_windows} windows, {n_windows/t_inference:.1f} win/s)")
+    print(f"{'─'*45}")
+    print(f"  전체 소요                : {t_total:7.2f}s")
+    print(f"{'─'*45}")
 
     print(f"\n[Zone Classification Report]")
     print(classification_report(all_zone_labels, all_zone_preds,

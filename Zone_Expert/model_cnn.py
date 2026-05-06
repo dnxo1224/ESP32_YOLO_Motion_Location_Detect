@@ -2,7 +2,7 @@
 Zone Expert Action Classifier — CNN 모델 모듈
 
 ZoneExpertCNN:
-  - Zone에 물리적으로 가까운 RX 채널을 입력 단계에서 강조 (정적 채널 가중치)
+  - Zone에 물리적으로 가까운 RX 채널을 입력 단계에서 강조 (정적 채널 가중치) - 현재는 X
   - 1D CNN (시간축 방향) → AdaptiveAvgPool → FC 분류기
 """
 import torch

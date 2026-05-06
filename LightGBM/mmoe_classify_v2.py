@@ -75,7 +75,7 @@ WEIGHTS_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'weigh
 # ── 모드 전환 ─────────────────────────────────────────────────────────────────
 #   'gru_shared' : v2 — Zone/Action 공유 GRU 인코더
 #   'dual'       : v3 — Zone(AvgPool) / Action(GRU) 분리 인코더
-ENCODER_MODE   = 'dual'
+ENCODER_MODE   = 'gru_shared'
 
 # ── 하이퍼파라미터 ────────────────────────────────────────────────────────────
 
