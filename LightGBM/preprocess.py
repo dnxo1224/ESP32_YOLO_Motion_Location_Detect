@@ -9,7 +9,6 @@
   5. processed/{subject}_{action}_{position}.npz 저장
      → grids: (4, 800, 166) float32  (4 RX 보간 완료 그리드)
 
-최초 1회만 실행. 이후 lgbm_classify.py 등에서 로드해 재사용.
 이미 저장된 파일은 자동 skip.
 
 실행:

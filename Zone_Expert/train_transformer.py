@@ -15,6 +15,7 @@ Zone Expert Action Classifier — Transformer 학습 스크립트
 """
 import os
 import sys
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -30,6 +31,15 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+# ─── 재현성을 위한 랜덤 시드 고정 ────────────────────────────────────────────
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark     = False
+
 from dataset import (
     CSIRawDataset, normalize_datasets, SlidingWindowDataset, get_device,
     TRAIN_SUBJECTS, TEST_SUBJECT,
@@ -40,6 +50,24 @@ from model_transformer import ZoneExpertTransformer
 # None → Zone 0~3 전체 순서대로 학습
 # 특정 Zone만 학습하려면 0 / 1 / 2 / 3 으로 직접 지정
 ZONE_ID = None
+
+# ─── Zone 강조 메커니즘 스위치 ──────────────────────────────────────────────
+# USE_RX_WEIGHT  : True  → 모델 입력에 Zone별 RX 채널 가중치 벡터 적용
+#                  False → 모든 RX 채널 동등하게 처리
+# USE_OVERSAMPLE : True  → 해당 Zone 데이터 ×2 복제 (데이터 불균형 부여)
+#                  False → 오버샘플링 없이 균등 학습
+# USE_ZONE_ONLY  : True  → 해당 Zone 데이터만 학습 (데이터량 약 1/4)
+#                  False → 전체 Zone 데이터 학습 (기존 방식)
+USE_RX_WEIGHT  = False
+USE_OVERSAMPLE = False
+USE_ZONE_ONLY  = False
+
+# 변형 태그 자동 생성 (저장 경로·파일명에 반영)
+_tag = 'transformer'
+if not USE_RX_WEIGHT:  _tag += '_norx'
+if not USE_OVERSAMPLE: _tag += '_noos'
+if USE_ZONE_ONLY:      _tag += '_zonly'
+VARIANT_TAG = _tag
 
 # ─── 하이퍼파라미터 ────────────────────────────────────────────────────────────
 WINDOW_SIZE  = 200
@@ -54,7 +82,7 @@ ACTION_NAMES = ['handsup', 'sit', 'stand', 'walk']
 
 # ─── 저장 경로 ────────────────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(__file__)
-WEIGHTS_DIR = os.path.join(BASE_DIR, 'weights_transformer')
+WEIGHTS_DIR = os.path.join(BASE_DIR, f'weights_{VARIANT_TAG}')
 RESULTS_DIR = os.path.join(BASE_DIR, 'results')
 os.makedirs(WEIGHTS_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -91,10 +119,10 @@ def save_confusion_matrix(preds, labels, zone_id, best_acc):
                 yticklabels=ACTION_NAMES, ax=ax)
     ax.set_xlabel('Predicted')
     ax.set_ylabel('True')
-    ax.set_title(f'Zone {zone_id} Expert (Transformer) — Action CM (window-level)\n'
+    ax.set_title(f'Zone {zone_id} Expert ({VARIANT_TAG.upper()}) — Action CM (window-level)\n'
                  f'Best Acc: {best_acc:.4f}')
     plt.tight_layout()
-    out_path = os.path.join(RESULTS_DIR, f'transformer_zone_expert_action_{zone_id}_cm.png')
+    out_path = os.path.join(RESULTS_DIR, f'{VARIANT_TAG}_zone_expert_action_{zone_id}_cm.png')
     plt.savefig(out_path, dpi=150)
     plt.close()
     print(f"[CM saved] {out_path}")
@@ -105,8 +133,12 @@ def save_confusion_matrix(preds, labels, zone_id, best_acc):
 def train(zone_id: int = ZONE_ID):
     device = get_device()
     print(f"\n{'='*50}")
-    print(f"Device : {device}")
-    print(f"Zone ID: {zone_id}  (Zone {zone_id} 전문가 Transformer 학습)")
+    print(f"Device      : {device}")
+    print(f"Zone ID     : {zone_id}")
+    print(f"Variant     : {VARIANT_TAG}  "
+          f"(rx_weight={'ON' if USE_RX_WEIGHT else 'OFF'}, "
+          f"oversample={'ON' if USE_OVERSAMPLE else 'OFF'}, "
+          f"zone_only={'ON' if USE_ZONE_ONLY else 'OFF'})")
 
     # ── 데이터 로드 ──────────────────────────────────────────────────────────
     print("\n[1] Loading raw datasets...")
@@ -122,16 +154,24 @@ def train(zone_id: int = ZONE_ID):
     train_win = SlidingWindowDataset(train_raw, WINDOW_SIZE, STRIDE)
     test_win  = SlidingWindowDataset(test_raw,  WINDOW_SIZE, STRIDE)
 
-    train_win.oversample_zone(zone_id, factor=2)
+    if USE_ZONE_ONLY:
+        train_win = train_win.filter_by_zone(zone_id)
+        if USE_OVERSAMPLE:
+            print(f"[경고] USE_ZONE_ONLY  = False 이므로 USE_OVERSAMPLE 효과 없음 (이미 Zone {zone_id} 데이터만 존재)")
+    elif USE_OVERSAMPLE:
+        train_win.oversample_zone(zone_id, factor=2)
 
     train_loader = DataLoader(train_win, batch_size=BATCH_SIZE, shuffle=True)
 
-    print(f"  Train windows : {len(train_win)} (Zone {zone_id} ×2 오버샘플링 적용)")
+    zone_note      = f'Zone {zone_id} 전용' if USE_ZONE_ONLY else '전체 Zone'
+    oversample_note = (f'Zone {zone_id} ×2 오버샘플링 적용'
+                       if (USE_OVERSAMPLE and not USE_ZONE_ONLY) else '오버샘플링 없음/미적용')
+    print(f"  Train windows : {len(train_win)} ({zone_note}, {oversample_note})")
     print(f"  Test  windows : {len(test_win)} (전체 Zone, 필터 없음)")
 
     # ── 모델 ─────────────────────────────────────────────────────────────────
-    print(f"\n[4] Building ZoneExpertTransformer (zone_id={zone_id})...")
-    model = ZoneExpertTransformer(zone_id=zone_id).to(device)
+    print(f"\n[4] Building ZoneExpertTransformer (zone_id={zone_id}, use_rx_weight={USE_RX_WEIGHT})...")
+    model = ZoneExpertTransformer(zone_id=zone_id, use_rx_weight=USE_RX_WEIGHT).to(device)
     print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  학습 파라미터 수: {total_params:,}")

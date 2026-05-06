@@ -50,19 +50,22 @@ class ZoneExpertTransformer(nn.Module):
                  dropout:         float = 0.1,
                  num_classes:     int   = 4,
                  max_seq_len:     int   = 200,
+                 use_rx_weight:   bool  = True,
                  rx_high_w:       float = RX_HIGH_W,
                  rx_low_w:        float = RX_LOW_W):
         super().__init__()
 
-        self.zone_id = zone_id
-        self.d_model = d_model
+        self.zone_id       = zone_id
+        self.d_model       = d_model
+        self.use_rx_weight = use_rx_weight
 
         # ── 고정 RX 채널 가중치 벡터 ──────────────────────────────────────────
-        rx_code_idx = ZONE_RX_MAP[zone_id]
-        w = torch.full((input_dim,), rx_low_w)
-        feature_idx = torch.arange(rx_code_idx, input_dim, 4)
-        w[feature_idx] = rx_high_w
-        self.register_buffer('rx_weight', w)  # (664,)
+        if use_rx_weight:
+            rx_code_idx = ZONE_RX_MAP[zone_id]
+            w = torch.full((input_dim,), rx_low_w)
+            feature_idx = torch.arange(rx_code_idx, input_dim, 4)
+            w[feature_idx] = rx_high_w
+            self.register_buffer('rx_weight', w)  # (664,)
 
         # ── 입력 선형 투영 (664 → d_model) ───────────────────────────────────
         self.input_proj = nn.Linear(input_dim, d_model)
@@ -108,12 +111,14 @@ class ZoneExpertTransformer(nn.Module):
             logits: (B, num_classes)
         """
         # ── RX 채널 가중치 ────────────────────────────────────────────────────
-        if zone_labels is not None:
-            mask = (zone_labels == self.zone_id).float()      # (B,)
-            w = mask.view(-1, 1, 1) * (self.rx_weight - 1.0) + 1.0  # (B, 1, 664)
-            x = x * w
-        else:
-            x = x * self.rx_weight                            # (B, T, 664)
+        if self.use_rx_weight:
+            if zone_labels is not None:
+                mask = (zone_labels == self.zone_id).float()             # (B,)
+                w = mask.view(-1, 1, 1) * (self.rx_weight - 1.0) + 1.0  # (B, 1, 664)
+                x = x * w
+            else:
+                x = x * self.rx_weight                                   # (B, T, 664)
+        # use_rx_weight=False → x 그대로 (모든 RX 채널 동등)
 
         # ── 입력 투영 + Positional Encoding ──────────────────────────────────
         x = self.input_proj(x)                                # (B, T, d_model)

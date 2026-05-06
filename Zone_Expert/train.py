@@ -6,8 +6,7 @@ Zone Expert Action Classifier — 학습 스크립트
   해당 Zone 전문가 모델을 학습한다.
 
 [평가 방식]
-  윈도우 1개 → 즉시 예측 (실시간 추론 방식과 동일)
-  Majority voting 미사용
+  윈도우 1개 → 즉시 예측
 
 [출력]
   weights/zone_expert_action_{zone_id}_best.pt
@@ -15,6 +14,7 @@ Zone Expert Action Classifier — 학습 스크립트
 """
 import os
 import sys
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -30,6 +30,15 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+# ─── 재현성을 위한 랜덤 시드 고정 ────────────────────────────────────────────
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark     = False
+
 from dataset import (
     CSIRawDataset, normalize_datasets, SlidingWindowDataset, get_device,
     TRAIN_SUBJECTS, TEST_SUBJECT,
@@ -39,7 +48,25 @@ from model import ZoneExpertLSTM
 # ─── 학습할 Zone 전문가 번호 ────────────────────────────────────────────────
 # None → Zone 0~3 전체 순서대로 학습
 # 특정 Zone만 학습하려면 0 / 1 / 2 / 3 으로 직접 지정
-zone_id = None
+ZONE_ID = None
+
+# ─── Zone 강조 메커니즘 스위치 ──────────────────────────────────────────────
+# USE_RX_WEIGHT  : True  → 모델 입력에 Zone별 RX 채널 가중치 벡터 적용
+#                  False → 모든 RX 채널 동등하게 처리
+# USE_OVERSAMPLE : True  → 해당 Zone 데이터 ×2 복제 (데이터 불균형 부여)
+#                  False → 오버샘플링 없이 균등 학습
+# USE_ZONE_ONLY  : True  → 해당 Zone 데이터만 학습 (데이터량 약 1/4)
+#                  False → 전체 Zone 데이터 학습 (기존 방식)
+USE_RX_WEIGHT  = False
+USE_OVERSAMPLE = False
+USE_ZONE_ONLY  = False
+
+# 변형 태그 자동 생성 (저장 경로·파일명에 반영)
+_tag = 'lstm'
+if not USE_RX_WEIGHT:  _tag += '_norx'
+if not USE_OVERSAMPLE: _tag += '_noos'
+if USE_ZONE_ONLY:      _tag += '_zonly'
+VARIANT_TAG = _tag
 
 # ─── 하이퍼파라미터 ────────────────────────────────────────────────────────────
 WINDOW_SIZE  = 200
@@ -54,7 +81,7 @@ ACTION_NAMES = ['handsup', 'sit', 'stand', 'walk']
 
 # ─── 저장 경로 ────────────────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(__file__)
-WEIGHTS_DIR = os.path.join(BASE_DIR, 'weights')
+WEIGHTS_DIR = os.path.join(BASE_DIR, f'weights_{VARIANT_TAG}')
 RESULTS_DIR = os.path.join(BASE_DIR, 'results')
 os.makedirs(WEIGHTS_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -99,10 +126,10 @@ def save_confusion_matrix(preds, labels, zone_id, best_acc):
                 yticklabels=ACTION_NAMES, ax=ax)
     ax.set_xlabel('Predicted')
     ax.set_ylabel('True')
-    ax.set_title(f'Zone {zone_id} Expert — Action CM (window-level)\n'
+    ax.set_title(f'Zone {zone_id} Expert ({VARIANT_TAG.upper()}) — Action CM (window-level)\n'
                  f'Best Acc: {best_acc:.4f}')
     plt.tight_layout()
-    out_path = os.path.join(RESULTS_DIR, f'zone_expert_action_{zone_id}_cm.png')
+    out_path = os.path.join(RESULTS_DIR, f'{VARIANT_TAG}_zone_expert_action_{zone_id}_cm.png')
     plt.savefig(out_path, dpi=150)
     plt.close()
     print(f"[CM saved] {out_path}")
@@ -110,11 +137,15 @@ def save_confusion_matrix(preds, labels, zone_id, best_acc):
 
 # ─── 학습 루프 ────────────────────────────────────────────────────────────────
 
-def train(zone_id: int = zone_id):
+def train(zone_id: int = ZONE_ID):
     device = get_device()
     print(f"\n{'='*50}")
-    print(f"Device : {device}")
-    print(f"Zone ID: {zone_id}  (Zone {zone_id} 전문가 학습)")
+    print(f"Device      : {device}")
+    print(f"Zone ID     : {zone_id}")
+    print(f"Variant     : {VARIANT_TAG}  "
+          f"(rx_weight={'ON' if USE_RX_WEIGHT else 'OFF'}, "
+          f"oversample={'ON' if USE_OVERSAMPLE else 'OFF'}, "
+          f"zone_only={'ON' if USE_ZONE_ONLY else 'OFF'})")
 
     # ── 데이터 로드 ──────────────────────────────────────────────────────────
     print("\n[1] Loading raw datasets...")
@@ -130,17 +161,24 @@ def train(zone_id: int = zone_id):
     train_win = SlidingWindowDataset(train_raw, WINDOW_SIZE, STRIDE)
     test_win  = SlidingWindowDataset(test_raw,  WINDOW_SIZE, STRIDE)
 
-    # Zone zone_id 데이터 2배 오버샘플링 (의도적 데이터 불균형)
-    train_win.oversample_zone(zone_id, factor=2)
+    if USE_ZONE_ONLY:
+        train_win = train_win.filter_by_zone(zone_id)
+        if USE_OVERSAMPLE:
+            print(f"[경고] USE_ZONE_ONLY  = False 이므로 USE_OVERSAMPLE 효과 없음 (이미 Zone {zone_id} 데이터만 존재)")
+    elif USE_OVERSAMPLE:
+        train_win.oversample_zone(zone_id, factor=2)
 
     train_loader = DataLoader(train_win, batch_size=BATCH_SIZE, shuffle=True)
 
-    print(f"  Train windows : {len(train_win)} (Zone {zone_id} ×2 오버샘플링 적용)")
+    zone_note      = f'Zone {zone_id} 전용' if USE_ZONE_ONLY else '전체 Zone'
+    oversample_note = (f'Zone {zone_id} ×2 오버샘플링 적용'
+                       if (USE_OVERSAMPLE and not USE_ZONE_ONLY) else '오버샘플링 없음/미적용')
+    print(f"  Train windows : {len(train_win)} ({zone_note}, {oversample_note})")
     print(f"  Test  windows : {len(test_win)} (전체 Zone, 필터 없음)")
 
     # ── 모델 ─────────────────────────────────────────────────────────────────
-    print(f"\n[4] Building ZoneExpertLSTM (zone_id={zone_id})...")
-    model = ZoneExpertLSTM(zone_id=zone_id).to(device)
+    print(f"\n[4] Building ZoneExpertLSTM (zone_id={zone_id}, use_rx_weight={USE_RX_WEIGHT})...")
+    model = ZoneExpertLSTM(zone_id=zone_id, use_rx_weight=USE_RX_WEIGHT).to(device)
     print(model)
 
     criterion = nn.CrossEntropyLoss()
@@ -208,6 +246,6 @@ def train(zone_id: int = zone_id):
 
 
 if __name__ == '__main__':
-    zones = range(4) if zone_id is None else [zone_id]
+    zones = range(4) if ZONE_ID is None else [ZONE_ID]
     for z in zones:
         train(z)

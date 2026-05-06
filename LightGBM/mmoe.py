@@ -1,41 +1,3 @@
-"""
-MMOE — Wi-Fi CSI Multi-task Classification (Zone + Action)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v1 — Shared CNN + AvgPool 인코더
-  - Per-RX 1D CNN + AdaptiveAvgPool (가중치 공유)
-  - MMOE: 6 Experts + 2 Gates (Zone/Action)
-  - Uncertainty Weighting + Mixup(α=0.4)
-  [문제] AvgPool이 시간 정보 소멸 → Action 57% 수준
-
-v2 — Shared CNN + GRU 인코더  ← 현재
-  - AvgPool → Bi-GRU 교체 (시간 순서 보존)
-  - Zone/Action 동일 인코더 공유
-  - ENCODER_MODE = 'gru_shared'
-
-v3 — Dual 인코더 (준비됨, 아직 미사용)
-  - Zone: CNN + AvgPool (공간 지문)
-  - Action: CNN + Bi-GRU (시간 다이나믹)
-  - 공유 CNN backbone + 태스크별 temporal aggregator
-  - ENCODER_MODE = 'dual' 로 전환
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-모드 전환:
-    ENCODER_MODE = 'gru_shared'   # v2 (현재)
-    ENCODER_MODE = 'dual'         # v3 (준비됨)
-
-실험 구성:
-  - test  : kjh, kms (2명 고정)
-  - train : 나머지 11명
-
-사전 실행:
-    python preprocess.py   # 최초 1회
-
-실행:
-    python mmoe_classify.py
-"""
-
 import os
 import warnings
 import numpy as np
@@ -64,7 +26,7 @@ NUM_RX         = 4
 SUBSAMPLE      = 1          # 800 → 200
 L_INPUT        = 800
 
-TEST_SUBJECTS  = ['kjh', 'kms']
+TEST_SUBJECTS  = ['kms']
 ACTION_NAMES   = ['handsup', 'sit', 'stand', 'walk']
 ZONE_NAMES     = ['Zone0', 'Zone1', 'Zone2', 'Zone3']
 
@@ -73,26 +35,25 @@ RESULTS_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resul
 WEIGHTS_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'weights')
 
 # ── 모드 전환 ─────────────────────────────────────────────────────────────────
-#   'gru_shared' : v2 — Zone/Action 공유 GRU 인코더
-#   'dual'       : v3 — Zone(AvgPool) / Action(GRU) 분리 인코더
-ENCODER_MODE   = 'gru_shared'
+# ★ 수정: 이기종 전문가 구조로 통합
+ENCODER_MODE   = 'hetero'
 
 # ── 하이퍼파라미터 ────────────────────────────────────────────────────────────
 
 CNN_CHANNELS   = [64, 128, 128]     # Per-RX CNN 채널
-GRU_HIDDEN     = 128                # GRU 단방향 hidden (Bi → 256 → proj 128)
-FUSION_DIM     = 256                # RX fusion 출력
-NUM_EXPERTS    = 6
-EXPERT_DIM     = 128
+GRU_HIDDEN     = 128                # GRU 단방향 hidden
+FUSION_DIM     = 256                # 비서(Gate)용 특징 차원
+NUM_EXPERTS    = 3                  # ★ 3명의 핵심 스페셜리스트
+EXPERT_DIM     = 128                # 전문가 리포트 차원
 TOWER_HIDDEN   = 64
 NUM_CLASSES    = 4
 
-BATCH_SIZE     = 16
+BATCH_SIZE     = 16   # EMD 때문에 16->64로 바뀜
 LR             = 1e-3
 WEIGHT_DECAY   = 1e-3
 MAX_EPOCHS     = 100
 PATIENCE       = 20
-GRAD_CLIP      = 1.0
+GRAD_CLIP      = 1.0 
 MIXUP_ALPHA    = 0.4
 SEED           = 42
 
@@ -126,7 +87,9 @@ def split_by_subjects(samples, test_subjects):
 
 class CSIDataset(Dataset):
     def __init__(self, grids, zones, actions, scaler=None, fit_scaler=False):
-        grids = grids[:, :, ::SUBSAMPLE, :]   # (N, 4, 200, 166)
+        grids = np.nan_to_num(grids, nan=0.0, posinf=0.0, neginf=0.0)
+        grids = np.clip(grids, 0.0, 10000.0)
+        grids = grids[:, :, ::SUBSAMPLE, :]   # (N, 4, 800, 166)
         N     = grids.shape[0]
         flat  = grids.reshape(-1, NUM_FEATURES)
         if fit_scaler:
@@ -168,12 +131,12 @@ def build_dataloaders(train_samples, test_samples):
     return train_loader, test_loader, scaler
 
 
-# ── 모델 블록 ─────────────────────────────────────────────────────────────────
+# ── 모델 블록 (전면 개조) ──────────────────────────────────────────────────────
 
 class CNNBackbone(nn.Module):
     """
     3-layer 1D CNN (공유 backbone).
-    입력: (B*4, 166, 200) → 출력: (B*4, 128, 25)
+    입력 길이에 상관없이 최종 출력 시간 차원을 무조건 T=90으로 강제 정렬.
     """
     def __init__(self):
         super().__init__()
@@ -182,50 +145,77 @@ class CNNBackbone(nn.Module):
             nn.BatchNorm1d(CNN_CHANNELS[0]), nn.GELU(),
             nn.Conv1d(CNN_CHANNELS[0], CNN_CHANNELS[1], kernel_size=5, stride=2, padding=2),
             nn.BatchNorm1d(CNN_CHANNELS[1]), nn.GELU(),
-            nn.Conv1d(CNN_CHANNELS[1], CNN_CHANNELS[2], kernel_size=3, stride=2, padding=1),
+            nn.Conv1d(CNN_CHANNELS[1], CNN_CHANNELS[2], kernel_size=3, stride=1, padding=1),
             nn.BatchNorm1d(CNN_CHANNELS[2]), nn.GELU(),
-        )   # (B*4, 128, 25)
+            # ★ 입력 길이에 무관하게 무조건 90프레임으로 맞춰주는 마법의 레이어
+            nn.AdaptiveAvgPool1d(90) 
+        )
 
     def forward(self, x):
         return self.layers(x)
 
 
 def _rx_input(x):
-    """(B, 4, 200, 166) → (B*4, 166, 200)"""
+    """(B, 4, 800, 166) → (B*4, 166, 800)"""
     B = x.size(0)
     return x.reshape(B * NUM_RX, L_INPUT, NUM_FEATURES).permute(0, 2, 1)
 
 
-def _gru_aggregate(cnn_out, gru, proj):
-    """
-    (B*4, 128, 25) → Bi-GRU → (B*4, 128)
+# ── 이기종 전문가 3인방 ───────────────────────────────────────────────────────
 
-    gru  : nn.GRU(batch_first=True, bidirectional=True)
-    proj : nn.Linear(256, 128)
-    """
-    # (B*4, 128, 25) → (B*4, 25, 128)
-    seq = cnn_out.permute(0, 2, 1)
-    _, h_n = gru(seq)                         # h_n: (2, B*4, GRU_HIDDEN)
-    h = torch.cat([h_n[0], h_n[1]], dim=-1)   # (B*4, 256)
-    return proj(h)                             # (B*4, 128)
+class TemporalExpert(nn.Module):
+    """전문가 1: 시간 흐름 전문가 (Bi-GRU) - [★평균 제거 적용]"""
+    def __init__(self):
+        super().__init__()
+        self.gru = nn.GRU(CNN_CHANNELS[-1], GRU_HIDDEN, num_layers=1, batch_first=True, bidirectional=True)
+        self.proj = nn.Linear(NUM_RX * GRU_HIDDEN * 2, EXPERT_DIM)
+
+    def forward(self, x):
+        # x: (B*4, 128, 90)
+        # 시간 축(90프레임)의 평균을 구해서 원본에서 뺌 (Static DC 성분 완벽 제거)
+        x_dynamic = x - x.mean(dim=-1, keepdim=True)
+        
+        seq = x_dynamic.permute(0, 2, 1)          # (B*4, 90, 128)
+        _, h_n = self.gru(seq)                    # h_n: (2, B*4, 128)
+        h = torch.cat([h_n[0], h_n[1]], dim=-1)   # (B*4, 256)
+        B = h.size(0) // NUM_RX
+        out = self.proj(h.reshape(B, NUM_RX * GRU_HIDDEN * 2))
+        return F.gelu(out)
 
 
-def _build_fusion():
-    return nn.Sequential(
-        nn.Linear(NUM_RX * CNN_CHANNELS[-1], FUSION_DIM),
-        nn.GELU(),
-        nn.Dropout(0.3),
-    )
+class SpatialExpert(nn.Module):
+    """전문가 2: 공간/위상 전문가 (AvgPool) - [★평균값만 추출]"""
+    def __init__(self):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.proj = nn.Linear(NUM_RX * CNN_CHANNELS[-1], EXPERT_DIM)
+
+    def forward(self, x):
+        # x: (B*4, 128, 90)
+        # 90프레임을 평균 내서 1개의 정적 지문으로 만듦 (움직임 노이즈 제거)
+        pooled = self.pool(x).squeeze(-1)         # (B*4, 128)
+        B = pooled.size(0) // NUM_RX
+        out = self.proj(pooled.reshape(B, NUM_RX * CNN_CHANNELS[-1]))
+        return F.gelu(out)
 
 
-def _build_experts():
-    return nn.ModuleList([
-        nn.Sequential(
-            nn.Linear(FUSION_DIM, EXPERT_DIM), nn.GELU(), nn.Dropout(0.2),
-            nn.Linear(EXPERT_DIM, EXPERT_DIM), nn.GELU(),
-        )
-        for _ in range(NUM_EXPERTS)
-    ])
+class FusionExpert(nn.Module):
+    """전문가 3: 시공간 융합 전문가 (Transformer) - [★원본 활용]"""
+    def __init__(self):
+        super().__init__()
+        self.time_pool = nn.AdaptiveAvgPool1d(1)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=CNN_CHANNELS[-1], nhead=4, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        self.proj = nn.Linear(NUM_RX * CNN_CHANNELS[-1], EXPERT_DIM)
+
+    def forward(self, x):
+        # x: (B*4, 128, 90)
+        B = x.size(0) // NUM_RX
+        pooled = self.time_pool(x).squeeze(-1)    # (B*4, 128)
+        seq = pooled.reshape(B, NUM_RX, -1)       # (B, 4, 128)
+        attn_out = self.transformer(seq)          # (B, 4, 128)
+        out = self.proj(attn_out.reshape(B, NUM_RX * CNN_CHANNELS[-1]))
+        return F.gelu(out)
 
 
 def _build_tower():
@@ -235,44 +225,32 @@ def _build_tower():
     )
 
 
-def _expert_mixture(experts, gate_logits, fused):
-    """
-    experts     : ModuleList, 각 expert: (B, FUSION_DIM) → (B, EXPERT_DIM)
-    gate_logits : (B, NUM_EXPERTS) — softmax 전
-    fused       : (B, FUSION_DIM)
-
-    Returns     : (B, EXPERT_DIM)
-    """
-    weights = F.softmax(gate_logits, dim=-1)             # (B, E)
-    stacked = torch.stack([e(fused) for e in experts], dim=1)  # (B, E, D)
-    return torch.einsum('be,bed->bd', weights, stacked)  # (B, D)
-
-
-# ── v2: Shared GRU Encoder ───────────────────────────────────────────────────
+# ── v4: 이기종 MMoE 모델 ───────────────────────────────────────────────────────
 
 class MMOEModel(nn.Module):
-    """
-    v2 — Zone/Action 공유 Bi-GRU 인코더.
-    AvgPool → Bi-GRU 교체로 시간 정보 보존.
-    """
     def __init__(self):
         super().__init__()
 
-        # Per-RX: CNN + Bi-GRU (공유)
-        self.cnn    = CNNBackbone()
-        self.gru    = nn.GRU(CNN_CHANNELS[-1], GRU_HIDDEN, num_layers=1,
-                             batch_first=True, bidirectional=True)
-        self.gru_proj = nn.Linear(GRU_HIDDEN * 2, CNN_CHANNELS[-1])
+        self.cnn = CNNBackbone()
 
-        # RX Fusion
-        self.rx_fusion = _build_fusion()
+        # Gate(비서) 전용 공통 요약기
+        self.gate_pool = nn.AdaptiveAvgPool1d(1)
+        self.gate_fusion = nn.Sequential(
+            nn.Linear(NUM_RX * CNN_CHANNELS[-1], FUSION_DIM),
+            nn.GELU(),
+            nn.Dropout(0.3)
+        )
+        self.gate_zone   = nn.Linear(FUSION_DIM, NUM_EXPERTS)
+        self.gate_action = nn.Linear(FUSION_DIM, NUM_EXPERTS)
 
-        # MMOE
-        self.experts      = _build_experts()
-        self.gate_zone    = nn.Linear(FUSION_DIM, NUM_EXPERTS)
-        self.gate_action  = nn.Linear(FUSION_DIM, NUM_EXPERTS)
+        # 3인의 스페셜리스트
+        self.experts = nn.ModuleList([
+            TemporalExpert(),
+            SpatialExpert(),
+            FusionExpert()
+        ])
 
-        # Towers
+        # 타워
         self.tower_zone   = _build_tower()
         self.tower_action = _build_tower()
 
@@ -280,110 +258,45 @@ class MMOEModel(nn.Module):
         self.log_var_zone   = nn.Parameter(torch.zeros(1))
         self.log_var_action = nn.Parameter(torch.zeros(1))
 
-    def _encode(self, x):
-        """(B, 4, 200, 166) → (B, 256)"""
-        B    = x.size(0)
-        feat = _gru_aggregate(self.cnn(_rx_input(x)), self.gru, self.gru_proj)
-        # (B*4, 128) → (B, 4*128) → (B, 256)
-        return self.rx_fusion(feat.reshape(B, NUM_RX * CNN_CHANNELS[-1]))
-
     def forward(self, x):
-        fused  = self._encode(x)                                      # (B, 256)
-        z_mix  = _expert_mixture(self.experts, self.gate_zone(fused),   fused)
-        a_mix  = _expert_mixture(self.experts, self.gate_action(fused), fused)
+        B = x.size(0)
+        
+        # 1. 뼈대 통과 (여기서 무조건 T=90으로 압축되어 나옵니다)
+        cnn_out = self.cnn(_rx_input(x))  # (B*4, 128, 90)
+
+        # 2. 비서(Gate)들의 상황 판단
+        gate_pooled = self.gate_pool(cnn_out).squeeze(-1)
+        gate_fused  = self.gate_fusion(gate_pooled.reshape(B, NUM_RX * CNN_CHANNELS[-1]))
+
+        w_z = F.softmax(self.gate_zone(gate_fused), dim=-1)   # (B, 3)
+        w_a = F.softmax(self.gate_action(gate_fused), dim=-1) # (B, 3)
+
+        # 3. 3명의 전문가 리포트 작성
+        expert_outputs = torch.stack([expert(cnn_out) for expert in self.experts], dim=1) # (B, 3, 128)
+
+        # 4. 리포트 가중합 및 타워 전송
+        z_mix = torch.einsum('be,bed->bd', w_z, expert_outputs)
+        a_mix = torch.einsum('be,bed->bd', w_a, expert_outputs)
+
         return self.tower_zone(z_mix), self.tower_action(a_mix)
 
     def get_gate_weights(self, x):
-        fused = self._encode(x)
-        return (F.softmax(self.gate_zone(fused),   dim=-1).mean(0).detach().cpu().numpy(),
-                F.softmax(self.gate_action(fused), dim=-1).mean(0).detach().cpu().numpy())
+        B = x.size(0)
+        cnn_out = self.cnn(_rx_input(x))
+        gate_pooled = self.gate_pool(cnn_out).squeeze(-1)
+        gate_fused  = self.gate_fusion(gate_pooled.reshape(B, NUM_RX * CNN_CHANNELS[-1]))
+        
+        return (F.softmax(self.gate_zone(gate_fused), dim=-1).mean(0).detach().cpu().numpy(),
+                F.softmax(self.gate_action(gate_fused), dim=-1).mean(0).detach().cpu().numpy())
 
     def compute_loss(self, zl, al, yz, ya):
+        # 파트 2에 정의된 _uncertainty_loss 함수와 연결
         return _uncertainty_loss(zl, al, yz, ya, self.log_var_zone, self.log_var_action)
 
     def compute_mixup_loss(self, zl, al, yza, yaa, yzb, yab, lam):
+        # 파트 2에 정의된 _uncertainty_mixup_loss 함수와 연결
         return _uncertainty_mixup_loss(zl, al, yza, yaa, yzb, yab, lam,
                                        self.log_var_zone, self.log_var_action)
-
-
-# ── v3: Dual Encoder ─────────────────────────────────────────────────────────
-
-class DualMMOEModel(nn.Module):
-    """
-    v3 — 태스크별 분리 인코더.
-
-    Zone   : CNN + AvgPool   (공간 지문 — 시간 평균)
-    Action : CNN + Bi-GRU    (시간 다이나믹 — 순서 보존)
-
-    CNN backbone은 공유, temporal aggregator만 분리.
-    MMOE experts/gates는 각 태스크의 fused representation으로 독립 운영.
-    """
-    def __init__(self):
-        super().__init__()
-
-        # ── 공유 CNN backbone ──
-        self.cnn = CNNBackbone()
-
-        # ── Zone: AvgPool aggregator ──
-        self.zone_pool = nn.AdaptiveAvgPool1d(1)
-
-        # ── Action: Bi-GRU aggregator ──
-        self.action_gru  = nn.GRU(CNN_CHANNELS[-1], GRU_HIDDEN, num_layers=1,
-                                  batch_first=True, bidirectional=True)
-        self.action_proj = nn.Linear(GRU_HIDDEN * 2, CNN_CHANNELS[-1])
-
-        # ── 분리 RX Fusion ──
-        self.zone_fusion   = _build_fusion()
-        self.action_fusion = _build_fusion()
-
-        # ── 분리 MMOE (experts 공유 X — 태스크 완전 분리) ──
-        self.zone_experts   = _build_experts()
-        self.action_experts = _build_experts()
-        self.gate_zone      = nn.Linear(FUSION_DIM, NUM_EXPERTS)
-        self.gate_action    = nn.Linear(FUSION_DIM, NUM_EXPERTS)
-
-        # ── Towers ──
-        self.tower_zone   = _build_tower()
-        self.tower_action = _build_tower()
-
-        # ── Uncertainty Weighting ──
-        self.log_var_zone   = nn.Parameter(torch.zeros(1))
-        self.log_var_action = nn.Parameter(torch.zeros(1))
-
-    def _encode_zone(self, x):
-        """(B, 4, 200, 166) → (B, 256)  AvgPool 경로"""
-        B    = x.size(0)
-        cnn  = self.cnn(_rx_input(x))                          # (B*4, 128, 25)
-        feat = self.zone_pool(cnn).squeeze(-1)                 # (B*4, 128)
-        return self.zone_fusion(feat.reshape(B, NUM_RX * CNN_CHANNELS[-1]))
-
-    def _encode_action(self, x):
-        """(B, 4, 200, 166) → (B, 256)  Bi-GRU 경로"""
-        B    = x.size(0)
-        cnn  = self.cnn(_rx_input(x))                          # (B*4, 128, 25)
-        feat = _gru_aggregate(cnn, self.action_gru, self.action_proj)  # (B*4, 128)
-        return self.action_fusion(feat.reshape(B, NUM_RX * CNN_CHANNELS[-1]))
-
-    def forward(self, x):
-        z_fused = self._encode_zone(x)                                        # (B, 256)
-        a_fused = self._encode_action(x)                                      # (B, 256)
-        z_mix   = _expert_mixture(self.zone_experts,   self.gate_zone(z_fused),   z_fused)
-        a_mix   = _expert_mixture(self.action_experts, self.gate_action(a_fused), a_fused)
-        return self.tower_zone(z_mix), self.tower_action(a_mix)
-
-    def get_gate_weights(self, x):
-        z_fused = self._encode_zone(x)
-        a_fused = self._encode_action(x)
-        return (F.softmax(self.gate_zone(z_fused),     dim=-1).mean(0).detach().cpu().numpy(),
-                F.softmax(self.gate_action(a_fused),   dim=-1).mean(0).detach().cpu().numpy())
-
-    def compute_loss(self, zl, al, yz, ya):
-        return _uncertainty_loss(zl, al, yz, ya, self.log_var_zone, self.log_var_action)
-
-    def compute_mixup_loss(self, zl, al, yza, yaa, yzb, yab, lam):
-        return _uncertainty_mixup_loss(zl, al, yza, yaa, yzb, yab, lam,
-                                       self.log_var_zone, self.log_var_action)
-
 
 # ── Loss 헬퍼 ─────────────────────────────────────────────────────────────────
 
@@ -402,13 +315,12 @@ def _uncertainty_mixup_loss(zl, al, yza, yaa, yzb, yab, lam, log_var_z, log_var_
 
 
 def build_model(mode=ENCODER_MODE):
-    """ENCODER_MODE에 따라 모델 생성."""
-    if mode == 'gru_shared':
+    """ENCODER_MODE에 따라 모델 생성 (현재 이기종 모드로 단일화됨)"""
+    if mode == 'hetero':
         return MMOEModel()
-    elif mode == 'dual':
-        return DualMMOEModel()
     else:
-        raise ValueError(f"Unknown ENCODER_MODE: '{mode}'. Use 'gru_shared' or 'dual'.")
+        # 안전망: 기본적으로 이기종 MMOE 모델 반환
+        return MMOEModel()
 
 
 # ── 학습 유틸리티 ────────────────────────────────────────────────────────────
@@ -527,17 +439,18 @@ def plot_training_curves(history):
 
 
 def save_gate_analysis(gate_zone_avg, gate_action_avg):
-    experts = [f'E{i}' for i in range(NUM_EXPERTS)]
-    x = np.arange(NUM_EXPERTS)
+    # ★ 논문용 시각화 강화: 전문가 라벨을 구체화
+    experts = ['Temporal\n(GRU)', 'Spatial\n(AvgPool)', 'Fusion\n(Transformer)']
+    x = np.arange(len(experts))
     w = 0.35
     fig, ax = plt.subplots(figsize=(8, 5))
-    bz = ax.bar(x - w / 2, gate_zone_avg,   w, label='Zone',   color='#4C72B0')
-    ba = ax.bar(x + w / 2, gate_action_avg, w, label='Action', color='#DD8452')
+    bz = ax.bar(x - w / 2, gate_zone_avg,   w, label='Zone Task',   color='#4C72B0')
+    ba = ax.bar(x + w / 2, gate_action_avg, w, label='Action Task', color='#DD8452')
     for bar in list(bz) + list(ba):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.003,
                 f'{bar.get_height():.3f}', ha='center', va='bottom', fontsize=8)
-    ax.set(xlabel='Expert', ylabel='Avg Gate Weight',
-           title=f'MMOE Gate Analysis [{ENCODER_MODE}]')
+    ax.set(xlabel='Expert Type', ylabel='Avg Gate Weight',
+           title=f'Heterogeneous MMoE Gate Analysis')
     ax.set_xticks(x); ax.set_xticklabels(experts); ax.legend()
     ax.set_ylim(0, max(gate_zone_avg.max(), gate_action_avg.max()) * 1.3)
     plt.tight_layout()
