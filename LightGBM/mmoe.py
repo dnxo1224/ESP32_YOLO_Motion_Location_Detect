@@ -1,4 +1,5 @@
 import os
+import time
 import warnings
 import numpy as np
 import matplotlib
@@ -23,8 +24,11 @@ warnings.filterwarnings('ignore')
 
 NUM_FEATURES   = 166
 NUM_RX         = 4
-SUBSAMPLE      = 1          # 800 → 200
-L_INPUT        = 800
+SUBSAMPLE      = 1          
+ORIGINAL_L     = 800        # 원본 데이터의 프레임 수
+L_INPUT        = 200        # ★ 수정: 200프레임 단위 슬라이싱 (실시간성 및 윈도우 크기 확대)
+NUM_CHUNKS     = ORIGINAL_L // (L_INPUT * SUBSAMPLE) # 800 // 200 = 4 조각
+POOL_SIZE      = 64         # ★ 수정: CNN 통과 후 프레임 규격화 사이즈 (최종 64차원)
 
 TEST_SUBJECTS  = ['kms']
 ACTION_NAMES   = ['handsup', 'sit', 'stand', 'walk']
@@ -35,7 +39,6 @@ RESULTS_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resul
 WEIGHTS_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'weights')
 
 # ── 모드 전환 ─────────────────────────────────────────────────────────────────
-# ★ 수정: 이기종 전문가 구조로 통합
 ENCODER_MODE   = 'hetero'
 
 # ── 하이퍼파라미터 ────────────────────────────────────────────────────────────
@@ -43,12 +46,12 @@ ENCODER_MODE   = 'hetero'
 CNN_CHANNELS   = [64, 128, 128]     # Per-RX CNN 채널
 GRU_HIDDEN     = 128                # GRU 단방향 hidden
 FUSION_DIM     = 256                # 비서(Gate)용 특징 차원
-NUM_EXPERTS    = 3                  # ★ 3명의 핵심 스페셜리스트
+NUM_EXPERTS    = 3                  # 핵심 스페셜리스트
 EXPERT_DIM     = 128                # 전문가 리포트 차원
 TOWER_HIDDEN   = 64
 NUM_CLASSES    = 4
 
-BATCH_SIZE     = 16   # EMD 때문에 16->64로 바뀜
+BATCH_SIZE     = 16 
 LR             = 1e-3
 WEIGHT_DECAY   = 1e-3
 MAX_EPOCHS     = 100
@@ -90,17 +93,32 @@ class CSIDataset(Dataset):
         grids = np.nan_to_num(grids, nan=0.0, posinf=0.0, neginf=0.0)
         grids = np.clip(grids, 0.0, 10000.0)
         grids = grids[:, :, ::SUBSAMPLE, :]   # (N, 4, 800, 166)
-        N     = grids.shape[0]
-        flat  = grids.reshape(-1, NUM_FEATURES)
+        
+        N = grids.shape[0]
+        
+        # ★ 수정: 800 프레임을 200 프레임씩 4개의 청크로 슬라이싱
+        # (N, 4, 800, 166) -> (N, 4, 4, 200, 166)
+        grids = grids.reshape(N, NUM_RX, NUM_CHUNKS, L_INPUT, NUM_FEATURES)
+        
+        # 청크를 배치 차원으로 편입: (N, 4, 4, 200, 166) -> (N*4, 4, 200, 166)
+        grids = grids.transpose(0, 2, 1, 3, 4).reshape(N * NUM_CHUNKS, NUM_RX, L_INPUT, NUM_FEATURES)
+        
+        # 데이터가 늘어났으므로 라벨도 복제
+        zones = np.repeat(zones, NUM_CHUNKS)
+        actions = np.repeat(actions, NUM_CHUNKS)
+
+        flat = grids.reshape(-1, NUM_FEATURES)
         if fit_scaler:
             assert scaler is not None
             scaler.fit(flat)
         if scaler is not None:
             flat = scaler.transform(flat).astype(np.float32)
-        grids = flat.reshape(N, NUM_RX, L_INPUT, NUM_FEATURES)
+        
+        # 스케일링 후 복구: (N*4, 4, 200, 166)
+        grids = flat.reshape(-1, NUM_RX, L_INPUT, NUM_FEATURES)
 
         self.grids   = torch.from_numpy(grids)
-        self.zones   = torch.from_numpy(np.array(zones,   dtype=np.int64))
+        self.zones   = torch.from_numpy(np.array(zones, dtype=np.int64))
         self.actions = torch.from_numpy(np.array(actions, dtype=np.int64))
 
     def __len__(self):
@@ -131,24 +149,30 @@ def build_dataloaders(train_samples, test_samples):
     return train_loader, test_loader, scaler
 
 
-# ── 모델 블록 (전면 개조) ──────────────────────────────────────────────────────
+# ── 모델 블록 ──────────────────────────────────────────────────────────────────
 
 class CNNBackbone(nn.Module):
     """
-    3-layer 1D CNN (공유 backbone).
-    입력 길이에 상관없이 최종 출력 시간 차원을 무조건 T=90으로 강제 정렬.
+    3-layer 1D CNN (Natural Tapering).
+    200프레임 입력 -> 96 -> 92 -> 90 -> AdaptivePool(64)로 우아하게 압축.
     """
     def __init__(self):
         super().__init__()
         self.layers = nn.Sequential(
-            nn.Conv1d(NUM_FEATURES,    CNN_CHANNELS[0], kernel_size=7, stride=2, padding=3),
+            # 1층: (200 - 7) / 2 + 1 = 96 프레임 (padding=0)
+            nn.Conv1d(NUM_FEATURES,    CNN_CHANNELS[0], kernel_size=7, stride=2, padding=0),
             nn.BatchNorm1d(CNN_CHANNELS[0]), nn.GELU(),
-            nn.Conv1d(CNN_CHANNELS[0], CNN_CHANNELS[1], kernel_size=5, stride=2, padding=2),
+            
+            # 2층: 96 - 5 + 1 = 92 프레임 (padding=0)
+            nn.Conv1d(CNN_CHANNELS[0], CNN_CHANNELS[1], kernel_size=5, stride=1, padding=0),
             nn.BatchNorm1d(CNN_CHANNELS[1]), nn.GELU(),
-            nn.Conv1d(CNN_CHANNELS[1], CNN_CHANNELS[2], kernel_size=3, stride=1, padding=1),
+            
+            # 3층: 92 - 3 + 1 = 90 프레임 (padding=0)
+            nn.Conv1d(CNN_CHANNELS[1], CNN_CHANNELS[2], kernel_size=3, stride=1, padding=0),
             nn.BatchNorm1d(CNN_CHANNELS[2]), nn.GELU(),
-            # ★ 입력 길이에 무관하게 무조건 90프레임으로 맞춰주는 마법의 레이어
-            nn.AdaptiveAvgPool1d(90) 
+            
+            # ★ 90프레임 -> 64프레임으로 최종 규격화 (안전한 Downsampling)
+            nn.AdaptiveAvgPool1d(POOL_SIZE) 
         )
 
     def forward(self, x):
@@ -156,7 +180,7 @@ class CNNBackbone(nn.Module):
 
 
 def _rx_input(x):
-    """(B, 4, 800, 166) → (B*4, 166, 800)"""
+    """(B, 4, 200, 166) → (B*4, 166, 200)"""
     B = x.size(0)
     return x.reshape(B * NUM_RX, L_INPUT, NUM_FEATURES).permute(0, 2, 1)
 
@@ -171,11 +195,11 @@ class TemporalExpert(nn.Module):
         self.proj = nn.Linear(NUM_RX * GRU_HIDDEN * 2, EXPERT_DIM)
 
     def forward(self, x):
-        # x: (B*4, 128, 90)
-        # 시간 축(90프레임)의 평균을 구해서 원본에서 뺌 (Static DC 성분 완벽 제거)
+        # x: (B*4, 128, 64)
+        # 시간 축(64프레임)의 평균을 구해서 원본에서 뺌 (Static DC 성분 완벽 제거)
         x_dynamic = x - x.mean(dim=-1, keepdim=True)
         
-        seq = x_dynamic.permute(0, 2, 1)          # (B*4, 90, 128)
+        seq = x_dynamic.permute(0, 2, 1)          # (B*4, 64, 128)
         _, h_n = self.gru(seq)                    # h_n: (2, B*4, 128)
         h = torch.cat([h_n[0], h_n[1]], dim=-1)   # (B*4, 256)
         B = h.size(0) // NUM_RX
@@ -191,8 +215,8 @@ class SpatialExpert(nn.Module):
         self.proj = nn.Linear(NUM_RX * CNN_CHANNELS[-1], EXPERT_DIM)
 
     def forward(self, x):
-        # x: (B*4, 128, 90)
-        # 90프레임을 평균 내서 1개의 정적 지문으로 만듦 (움직임 노이즈 제거)
+        # x: (B*4, 128, 64)
+        # 64프레임을 평균 내서 1개의 정적 지문으로 만듦 (움직임 노이즈 제거)
         pooled = self.pool(x).squeeze(-1)         # (B*4, 128)
         B = pooled.size(0) // NUM_RX
         out = self.proj(pooled.reshape(B, NUM_RX * CNN_CHANNELS[-1]))
@@ -209,7 +233,7 @@ class FusionExpert(nn.Module):
         self.proj = nn.Linear(NUM_RX * CNN_CHANNELS[-1], EXPERT_DIM)
 
     def forward(self, x):
-        # x: (B*4, 128, 90)
+        # x: (B*4, 128, 64)
         B = x.size(0) // NUM_RX
         pooled = self.time_pool(x).squeeze(-1)    # (B*4, 128)
         seq = pooled.reshape(B, NUM_RX, -1)       # (B, 4, 128)
@@ -261,8 +285,8 @@ class MMOEModel(nn.Module):
     def forward(self, x):
         B = x.size(0)
         
-        # 1. 뼈대 통과 (여기서 무조건 T=90으로 압축되어 나옵니다)
-        cnn_out = self.cnn(_rx_input(x))  # (B*4, 128, 90)
+        # 1. 뼈대 통과 (여기서 무조건 T=64로 압축되어 나옵니다)
+        cnn_out = self.cnn(_rx_input(x))  # (B*4, 128, 64)
 
         # 2. 비서(Gate)들의 상황 판단
         gate_pooled = self.gate_pool(cnn_out).squeeze(-1)
@@ -290,11 +314,9 @@ class MMOEModel(nn.Module):
                 F.softmax(self.gate_action(gate_fused), dim=-1).mean(0).detach().cpu().numpy())
 
     def compute_loss(self, zl, al, yz, ya):
-        # 파트 2에 정의된 _uncertainty_loss 함수와 연결
         return _uncertainty_loss(zl, al, yz, ya, self.log_var_zone, self.log_var_action)
 
     def compute_mixup_loss(self, zl, al, yza, yaa, yzb, yab, lam):
-        # 파트 2에 정의된 _uncertainty_mixup_loss 함수와 연결
         return _uncertainty_mixup_loss(zl, al, yza, yaa, yzb, yab, lam,
                                        self.log_var_zone, self.log_var_action)
 
@@ -315,11 +337,9 @@ def _uncertainty_mixup_loss(zl, al, yza, yaa, yzb, yab, lam, log_var_z, log_var_
 
 
 def build_model(mode=ENCODER_MODE):
-    """ENCODER_MODE에 따라 모델 생성 (현재 이기종 모드로 단일화됨)"""
     if mode == 'hetero':
         return MMOEModel()
     else:
-        # 안전망: 기본적으로 이기종 MMOE 모델 반환
         return MMOEModel()
 
 
@@ -400,6 +420,46 @@ def evaluate(model, loader, device):
             gate_z_avg, gate_a_avg)
 
 
+# ── 추론 벤치마크 ────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def benchmark_inference(model, loader, device, warmup_batches=3):
+    model.eval()
+    def sync():
+        if device.type == 'cuda': torch.cuda.synchronize()
+
+    all_batches = list(loader)
+    n_chunks = sum(x.size(0) for x, _, _ in all_batches)
+
+    for x, _, _ in all_batches[:warmup_batches]:
+        model(x.to(device))
+    sync()
+
+    batch_times = []; t0_total = time.perf_counter()
+    for x, _, _ in all_batches:
+        x = x.to(device); sync()
+        t0 = time.perf_counter(); model(x); sync()
+        batch_times.append((time.perf_counter() - t0) * 1000)
+
+    total_ms  = (time.perf_counter() - t0_total) * 1000
+    per_chunk = total_ms / n_chunks
+
+    print(f'\n{"="*60}')
+    print(f'Inference Benchmark  [MMoE / Hetero]')
+    print(f'{"="*60}')
+    print(f'  Device           : {device}')
+    print(f'  Total chunks     : {n_chunks}  ({n_chunks // NUM_CHUNKS} recordings × {NUM_CHUNKS} chunks)')
+    print(f'  Chunk size       : {L_INPUT} frames  (= ZoneMoE window size)')
+    print(f'  Batch size       : {loader.batch_size}')
+    print(f'  Total time       : {total_ms:.1f} ms  ({total_ms/1000:.3f} s)')
+    print(f'  Per chunk        : {per_chunk:.3f} ms')
+    print(f'  Per batch (avg)  : {np.mean(batch_times):.2f} ± {np.std(batch_times):.2f} ms')
+    print(f'  Throughput       : {n_chunks/(total_ms/1000):.1f} chunks/s')
+    print(f'  Tasks per pass   : zone + action  (1 forward pass)')
+    return dict(total_ms=total_ms, per_chunk=per_chunk,
+                per_batch=np.mean(batch_times), n_chunks=n_chunks)
+
+
 # ── 시각화 ───────────────────────────────────────────────────────────────────
 
 def save_confusion_matrix(y_true, y_pred, label_names, task_name, acc):
@@ -439,7 +499,6 @@ def plot_training_curves(history):
 
 
 def save_gate_analysis(gate_zone_avg, gate_action_avg):
-    # ★ 논문용 시각화 강화: 전문가 라벨을 구체화
     experts = ['Temporal\n(GRU)', 'Spatial\n(AvgPool)', 'Fusion\n(Transformer)']
     x = np.arange(len(experts))
     w = 0.35
@@ -557,11 +616,15 @@ def main():
     plot_training_curves(history)
     save_gate_analysis(g_zone, g_action)
 
+    bench = benchmark_inference(model, test_loader, device)
+
     summary_path = os.path.join(RESULTS_DIR, 'accuracy_summary.csv')
     with open(summary_path, 'w') as f:
-        f.write('mode,task,test_subjects,accuracy,best_epoch\n')
-        f.write(f'{ENCODER_MODE},zone,"{"+".join(TEST_SUBJECTS)}",{zone_acc*100:.4f},{best_epoch}\n')
-        f.write(f'{ENCODER_MODE},action,"{"+".join(TEST_SUBJECTS)}",{action_acc*100:.4f},{best_epoch}\n')
+        f.write('mode,task,test_subjects,accuracy,best_epoch,infer_per_chunk_ms,throughput_cps\n')
+        f.write(f'{ENCODER_MODE},zone,"{"+".join(TEST_SUBJECTS)}",{zone_acc*100:.4f},{best_epoch},'
+                f'{bench["per_chunk"]:.3f},{bench["n_chunks"]/(bench["total_ms"]/1000):.1f}\n')
+        f.write(f'{ENCODER_MODE},action,"{"+".join(TEST_SUBJECTS)}",{action_acc*100:.4f},{best_epoch},'
+                f'{bench["per_chunk"]:.3f},{bench["n_chunks"]/(bench["total_ms"]/1000):.1f}\n')
     print(f'\n  Summary saved → {summary_path}')
 
     print(f'\n{"="*60}')
@@ -572,6 +635,8 @@ def main():
     print(f'  Action Accuracy: {action_acc * 100:.2f}%')
     print(f'  Mean   Accuracy: {(zone_acc + action_acc) / 2 * 100:.2f}%')
     print(f'  Best Epoch     : {best_epoch}')
+    print(f'  Infer/chunk    : {bench["per_chunk"]:.3f} ms  (zone+action, 1 forward pass)')
+    print(f'  Throughput     : {bench["n_chunks"]/(bench["total_ms"]/1000):.1f} chunks/s')
 
 
 if __name__ == '__main__':

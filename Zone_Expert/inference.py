@@ -313,6 +313,95 @@ def run():
 
     t_inference = time.perf_counter() - t0
 
+    # ── 추론 벤치마크 (warmup 포함, ZoneMLP / ZoneExpert 분리 측정) ────────────
+    def sync():
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+
+    WARMUP = 3
+    all_batches = list(test_loader)
+    n_windows_bench = sum(x.size(0) for x, _, _ in all_batches)
+
+    # Warmup
+    with torch.no_grad():
+        for x, _, _ in all_batches[:WARMUP]:
+            x = x.to(device)
+            zp = zone_mlp(x).argmax(1)
+            xm = x - x.mean(dim=1, keepdim=True)
+            for z in range(NUM_ZONES):
+                mask = (zp == z)
+                if mask.sum() > 0 and MODEL_TYPE != 'svm':
+                    experts[z](xm[mask])
+    sync()
+
+    # ZoneMLP 단독 측정
+    t_mlp_list = []
+    with torch.no_grad():
+        for x, _, _ in all_batches:
+            x = x.to(device); sync()
+            t0b = time.perf_counter()
+            zone_mlp(x)
+            sync()
+            t_mlp_list.append((time.perf_counter() - t0b) * 1000)
+
+    # ZoneExpert 단독 측정 (zone_pred는 미리 계산)
+    t_exp_list = []
+    with torch.no_grad():
+        for x, _, _ in all_batches:
+            x  = x.to(device)
+            zp = zone_mlp(x).argmax(1)
+            xm = x - x.mean(dim=1, keepdim=True)
+            sync()
+            t0b = time.perf_counter()
+            for z in range(NUM_ZONES):
+                mask = (zp == z)
+                if mask.sum() > 0 and MODEL_TYPE != 'svm':
+                    experts[z](xm[mask])
+            sync()
+            t_exp_list.append((time.perf_counter() - t0b) * 1000)
+
+    # 전체 파이프라인 측정 (ZoneMLP + routing + ZoneExpert)
+    t_pipe_list = []
+    t_pipe_start = time.perf_counter()
+    with torch.no_grad():
+        for x, _, _ in all_batches:
+            x = x.to(device); sync()
+            t0b = time.perf_counter()
+            zp = zone_mlp(x).argmax(1)
+            xm = x - x.mean(dim=1, keepdim=True)
+            for z in range(NUM_ZONES):
+                mask = (zp == z)
+                if mask.sum() > 0 and MODEL_TYPE != 'svm':
+                    experts[z](xm[mask])
+            sync()
+            t_pipe_list.append((time.perf_counter() - t0b) * 1000)
+    t_pipe_total = (time.perf_counter() - t_pipe_start) * 1000
+
+    mlp_total  = sum(t_mlp_list)
+    exp_total  = sum(t_exp_list)
+    mlp_per_w  = mlp_total  / n_windows_bench
+    exp_per_w  = exp_total  / n_windows_bench
+    pipe_per_w = t_pipe_total / n_windows_bench
+
+    print(f'\n{"="*60}')
+    print(f'Inference Benchmark  [ZoneMoE / {MODEL_TYPE}]')
+    print(f'{"="*60}')
+    print(f'  Device             : {device}')
+    print(f'  Total windows      : {n_windows_bench}')
+    print(f'  Batch size         : {BATCH_SIZE}')
+    print(f'  Warmup batches     : {WARMUP}')
+    print(f'  ── Pass 1 ZoneMLP ──────────────────────')
+    print(f'  Total time         : {mlp_total:.1f} ms')
+    print(f'  Per window         : {mlp_per_w:.3f} ms')
+    print(f'  ── Pass 2 ZoneExpert ───────────────────')
+    print(f'  Total time         : {exp_total:.1f} ms')
+    print(f'  Per window         : {exp_per_w:.3f} ms')
+    print(f'  ── Pipeline (Pass1 + Pass2) ────────────')
+    print(f'  Total time         : {t_pipe_total:.1f} ms  ({t_pipe_total/1000:.3f} s)')
+    print(f'  Per window         : {pipe_per_w:.3f} ms')
+    print(f'  Per batch (avg)    : {np.mean(t_pipe_list):.2f} ± {np.std(t_pipe_list):.2f} ms')
+    print(f'  Throughput         : {n_windows_bench / (t_pipe_total/1000):.1f} windows/s')
+
     # ── 결과 출력 ─────────────────────────────────────────────────────────────
     zone_acc   = sum(p == l for p, l in zip(all_zone_preds,   all_zone_labels))   / len(all_zone_labels)
     action_acc = sum(p == l for p, l in zip(all_action_preds, all_action_labels)) / len(all_action_labels)
