@@ -65,6 +65,22 @@ python Realtime/main.py --mode live --ports COM7 --mirror
 `--mirror` 없이 포트 1~3개만 주면 미수신 채널을 NaN→0으로 채워 돌긴 하지만
 경고가 출력된다 (동작 테스트는 mirror 권장).
 
+## 4Tx–1Rx 신규 파이프라인 (개발 중)
+
+설계: 5GHz CSI 측정(C5) / 2.4GHz 데이터 전송(S3) 대역 분리, 송신 ESP가 서버로 TCP 직결.
+프레임 사양은 [FRAME_SPEC.md](FRAME_SPEC.md) 참조 (436B 바이너리, CRC16).
+
+| 파일 | 역할 |
+|---|---|
+| `csi_frame.py` | 프레임 v1 인코더/디코더 + 스트림 파서 (`python Realtime/csi_frame.py`로 자가 검증) |
+| `tcp_source.py` | TCP 프레임 서버 — `python Realtime/tcp_source.py --port 5010` |
+| `fake_tx_client.py` | 서버 검증용 가짜 클라이언트 (쓰레기/CRC 오염 주입) |
+
+펌웨어 (esp-idf fork `examples/get-started/`):
+- `csi_tx_relay/` — 송신 ESP (S3): UART→TCP 바이트 파이프. `TEST_FRAME_GEN=1`이면
+  합성 프레임 자체 생성(2단계), 0이면 UART 릴레이(3단계). WiFi/서버 설정은 app_main.c 상단.
+- `csi_fake_rx/` — 가짜 Rx (S3): 436B 프레임을 UART1(GPIO17, 2M baud)로 방출.
+
 ## 주의사항
 
 - `[stats]` 라인의 RX별 카운트로 실효 수신율 확인
